@@ -1,0 +1,304 @@
+// png.nv — the eight-byte signature, the IHDR fields, and the
+// arithmetic every other module in this package does on them.
+//
+// THE SIGNATURE IS NOT ARBITRARY
+//
+//     137 80 78 71 13 10 26 10
+//
+// Every byte of it is a test.  137 has the high bit set, so a transfer
+// that stripped it is caught.  `PNG` is there so a person running
+// `head` on the file sees what it is.  `13 10` is a CRLF and `10` a
+// bare LF, so a transfer that translated line endings in either
+// direction is caught.  `26` is DOS end-of-file, so `TYPE` on a
+// terminal stops there instead of scrolling binary.  A decoder that
+// checked only the first four bytes would accept a file an FTP client
+// had corrupted, which is exactly the failure the other four exist to
+// catch (PNG specification § 5.2).
+//
+// COLOUR TYPE AND BIT DEPTH ARE NOT INDEPENDENT
+//
+// PNG allows five colour types and five bit depths, and only fifteen
+// of the twenty-five combinations are legal.  Greyscale takes all
+// five; palette takes 1, 2, 4 and 8 and never 16, because a palette
+// index above 255 has nowhere to point; and the three colour types
+// with more than one channel take only 8 and 16.  `is_valid_combination`
+// is that table, written once, and `read_header` refuses everything it
+// refuses — a decoder that accepted a 16-bit palette would be reading
+// a file no encoder can have written.
+//
+// WHERE THE PIXEL SIZES COME FROM
+//
+// A row is `ceil(width * channels * depth / 8)` bytes plus one for the
+// filter byte, and at depths below 8 the last byte of a row is PADDED:
+// a 3-pixel row at 1 bit per pixel is one byte with five bits of
+// nothing in it, and the padding does not carry over into the next
+// row.  That single rule is what makes sub-byte PNGs the ones every
+// decoder gets wrong, and it is why `bytes_per_row` is a function
+// here rather than a multiplication at each call site.
+
+// How the samples in a PNG's pixels are to be read.
+//
+// The five of PNG specification § 6, by their own numbers: 0, 2, 3, 4
+// and 6.  1, 5 and 7 do not exist and never will — the value is a
+// bitfield in disguise, where bit 0 means palette, bit 1 means colour
+// and bit 2 means alpha, and the three missing numbers are the
+// combinations that make no sense.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.color_type_byte(PngIndexed)}")        // 3
+// ```
+pub enum PngColorType
+    // 0 — one greyscale sample per pixel.
+    PngGrey
+    // 2 — three samples: red, green, blue.
+    PngTruecolor
+    // 3 — one sample per pixel, an index into the PLTE chunk.  The
+    // only colour type for which PLTE is required rather than
+    // optional.
+    PngIndexed
+    // 4 — two samples: grey and alpha.
+    PngGreyAlpha
+    // 6 — four samples: red, green, blue, alpha.
+    PngTruecolorAlpha
+
+// How many bits each sample of a pixel occupies.
+//
+// An enum rather than an `Int` because only five values exist and
+// because which of them a colour type admits is a table rather than a
+// range — a signature taking an `Int` would accept 3, 7 and 32 and
+// have to refuse them at run time.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.depth_bits(PngDepth16)}")             // 16
+// ```
+pub enum PngBitDepth
+    // 1 bit per sample: eight pixels to a byte, greyscale or palette.
+    PngDepth1
+    // 2 bits per sample: four pixels to a byte.
+    PngDepth2
+    // 4 bits per sample: two pixels to a byte.
+    PngDepth4
+    // 8 bits per sample: the common case.
+    PngDepth8
+    // 16 bits per sample, BIG-endian on the wire.  Not available for
+    // a palette, where an index has nowhere above 255 to point.
+    PngDepth16
+
+// Whether the image's rows are in raster order or in Adam7's seven
+// passes.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.pass_count(PngAdam7)}")               // 7
+// ```
+pub enum PngInterlace
+    // 0 — rows top to bottom, each one whole.
+    PngNoInterlace
+    // 1 — Adam7: seven passes over a repeating 8×8 grid, each a
+    // complete small image with its own filter bytes.  See
+    // `pngadam7.nv`.
+    PngAdam7
+
+// Everything the IHDR chunk says about an image.
+//
+// The first thing a decoder knows and the last thing that may change:
+// IHDR is required to be the first chunk and there is exactly one of
+// it, so every other chunk is read in terms of this.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 8, height: 8, color: PngTruecolor, depth: PngDepth8, interlace: PngNoInterlace }
+//     println("${png.bytes_per_row(i, 8)}")                // 24
+// ```
+pub struct PngInfo
+    // Width in pixels.  Zero is refused: PNG specification § 11.2.2
+    // makes both dimensions non-zero, and an image with no pixels has
+    // no IDAT that could be correct.
+    width: Int
+    // Height in pixels.  Zero is refused for the same reason.
+    height: Int
+    // How the samples are to be read.
+    color: PngColorType
+    // How many bits each sample occupies.
+    depth: PngBitDepth
+    // Raster order or Adam7.
+    interlace: PngInterlace
+
+// The eight bytes every PNG file starts with.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${bytes.len(png.signature())}")             // 8
+// ```
+pub fn signature() -> Bytes
+    todo("png-nv.png.signature")
+
+// Whether a buffer starts with all eight signature bytes.
+//
+// All eight, not the first four: the last four are the CRLF, LF and
+// DOS-EOF bytes that catch a transfer which translated line endings,
+// and checking only the magic throws that away.  A buffer shorter than
+// eight bytes answers false rather than panicking.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.is_png(png.signature())}")            // true
+// ```
+pub fn is_png(src: Bytes) -> Bool
+    todo("png-nv.png.is_png")
+
+// The colour type's own number: 0, 2, 3, 4 or 6.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.color_type_byte(PngTruecolorAlpha)}") // 6
+// ```
+pub fn color_type_byte(c: PngColorType) -> Int
+    todo("png-nv.png.color_type_byte")
+
+// The bit depth as a number of bits.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.depth_bits(PngDepth4)}")              // 4
+// ```
+pub fn depth_bits(d: PngBitDepth) -> Int
+    todo("png-nv.png.depth_bits")
+
+// How many samples each pixel of this colour type carries.
+//
+// 1 for greyscale and palette, 2 for grey-alpha, 3 for truecolour, 4
+// for truecolour-alpha.  A palette index is ONE sample however many
+// colours the palette holds, which is the thing a reader most often
+// gets wrong when sizing a row.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.channel_count(PngGreyAlpha)}")        // 2
+// ```
+pub fn channel_count(c: PngColorType) -> Int
+    todo("png-nv.png.channel_count")
+
+// Whether a colour type and a bit depth may appear together.
+//
+// Fifteen of the twenty-five combinations are legal (PNG specification
+// § 11.2.2).  Greyscale takes every depth; palette takes 1, 2, 4 and 8
+// and never 16; grey-alpha, truecolour and truecolour-alpha take only
+// 8 and 16.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.is_valid_combination(PngIndexed, PngDepth16)}")   // false
+// ```
+pub fn is_valid_combination(c: PngColorType, d: PngBitDepth) -> Bool
+    todo("png-nv.png.is_valid_combination")
+
+// How many bits one pixel occupies: channels times depth.
+//
+// `1 ..= 64`.  Below 8 it is what makes a row's last byte padded, and
+// at 64 — sixteen-bit truecolour with alpha — it is what makes a
+// filter's "previous pixel" eight bytes back rather than one.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 1, height: 1, color: PngTruecolorAlpha, depth: PngDepth16, interlace: PngNoInterlace }
+//     println("${png.bits_per_pixel(i)}")                  // 64
+// ```
+pub fn bits_per_pixel(i: PngInfo) -> Int
+    todo("png-nv.png.bits_per_pixel")
+
+// The filter's stride: how many bytes back the "previous pixel" is.
+//
+// `max(1, bits_per_pixel / 8)`.  It is 1 for everything below 8 bits
+// per pixel, because a filter at sub-byte depths works on BYTES and
+// not on pixels — which is the second thing every decoder gets wrong
+// about 1-bit images, after the padding.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 8, height: 1, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+//     println("${png.filter_stride(i)}")                   // 1
+// ```
+pub fn filter_stride(i: PngInfo) -> Int
+    todo("png-nv.png.filter_stride")
+
+// How many bytes a row of `width` pixels occupies, without its filter
+// byte.
+//
+// `ceil(width * channels * depth / 8)`.  The rounding up is the
+// padding: a 3-pixel row at 1 bit per pixel is one byte with five bits
+// of nothing at its end, and those bits do not carry into the next
+// row.
+//
+// The width is a parameter rather than being read from the `PngInfo`
+// because Adam7's passes are narrower than the image; a caller
+// decoding a non-interlaced image passes `i.width`.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 3, height: 1, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+//     println("${png.bytes_per_row(i, 3)}")                // 1
+// ```
+pub fn bytes_per_row(i: PngInfo, width: Int) -> Int
+    todo("png-nv.png.bytes_per_row")
+
+// How many bytes a whole non-interlaced image occupies as filtered
+// rows, filter bytes included.
+//
+// `height * (bytes_per_row + 1)` — the exact size of the zlib stream's
+// PLAINTEXT, which is what a decoder allocates and what an encoder
+// compresses.  For an interlaced image this is not the answer;
+// `pngadam7.total_filtered_size` is.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 3, height: 2, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+//     println("${png.filtered_size(i)}")                   // 4
+// ```
+pub fn filtered_size(i: PngInfo) -> Int
+    todo("png-nv.png.filtered_size")
+
+// How many passes an interlace method has: 1 or 7.
+//
+// A function rather than a constant so that a caller's loop is written
+// once for both cases — `for p in 0..png.pass_count(i.interlace)` is
+// the same code for a raster image and an Adam7 one.
+//
+// ```novo
+// use png
+//
+// fn main() [io]
+//     println("${png.pass_count(PngNoInterlace)}")         // 1
+// ```
+pub fn pass_count(l: PngInterlace) -> Int
+    todo("png-nv.png.pass_count")

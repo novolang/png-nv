@@ -1,0 +1,152 @@
+// png_tests.nv — the API suite for the signature, the IHDR fields and
+// the size arithmetic.
+//
+// RED ON PURPOSE.  Every body in this package is a `todo()`, so every
+// assertion below reaches `not implemented: png-nv.<module>.<fn>` and
+// the suite fails.  That is the expected state of an interface package
+// and it is what makes these tests worth writing NOW: they compile
+// against the signatures, which is the claim being reviewed, and the
+// day a body lands the suite says whether the body agrees with what
+// was promised.
+//
+// The numbers here are the specification's, so they are binding: the
+// signature's eight bytes, the fifteen legal colour-type/depth pairs,
+// and the ceiling division that pads a sub-byte row.
+
+use std.test
+use png
+
+@test
+fn test_the_signature_is_eight_bytes_and_all_of_them_are_checked() [io]
+    test.case("eight, not four")
+    test.assert(bytes.len(png.signature()) == 8)
+    test.assert(png.is_png(png.signature()))
+
+    test.case("the high bit of the first byte catches a stripped transfer")
+    test.assert(bytes.byte_at(png.signature(), 0) == Some(137))
+
+    test.case("PNG in ASCII, so head(1) shows what the file is")
+    test.assert(bytes.byte_at(png.signature(), 1) == Some('P'))
+    test.assert(bytes.byte_at(png.signature(), 3) == Some('G'))
+
+    test.case("CRLF then LF then DOS end-of-file")
+    test.assert(bytes.byte_at(png.signature(), 4) == Some(13))
+    test.assert(bytes.byte_at(png.signature(), 5) == Some(10))
+    test.assert(bytes.byte_at(png.signature(), 6) == Some(26))
+    test.assert(bytes.byte_at(png.signature(), 7) == Some(10))
+
+@test
+fn test_a_short_or_wrong_buffer_is_not_a_png() [io]
+    test.case("nothing to compare and no panic")
+    test.assert(png.is_png(bytes.zeros(4)) == false)
+
+    test.case("and eight of the wrong bytes are not a signature either")
+    test.assert(png.is_png(bytes.zeros(8)) == false)
+
+@test
+fn test_the_colour_types_are_their_own_numbers() [io]
+    test.case("0, 2, 3, 4, 6 — and 1, 5, 7 do not exist")
+    test.assert(png.color_type_byte(PngGrey) == 0)
+    test.assert(png.color_type_byte(PngTruecolor) == 2)
+    test.assert(png.color_type_byte(PngIndexed) == 3)
+    test.assert(png.color_type_byte(PngGreyAlpha) == 4)
+    test.assert(png.color_type_byte(PngTruecolorAlpha) == 6)
+
+@test
+fn test_the_bit_depths_are_their_own_bit_counts() [io]
+    test.case("1, 2, 4, 8, 16")
+    test.assert(png.depth_bits(PngDepth1) == 1)
+    test.assert(png.depth_bits(PngDepth2) == 2)
+    test.assert(png.depth_bits(PngDepth4) == 4)
+    test.assert(png.depth_bits(PngDepth8) == 8)
+    test.assert(png.depth_bits(PngDepth16) == 16)
+
+@test
+fn test_a_palette_index_is_one_sample_however_many_colours() [io]
+    test.case("the count a reader most often gets wrong")
+    test.assert(png.channel_count(PngIndexed) == 1)
+    test.assert(png.channel_count(PngGrey) == 1)
+    test.assert(png.channel_count(PngGreyAlpha) == 2)
+    test.assert(png.channel_count(PngTruecolor) == 3)
+    test.assert(png.channel_count(PngTruecolorAlpha) == 4)
+
+@test
+fn test_only_fifteen_of_the_twenty_five_combinations_are_legal() [io]
+    test.case("greyscale takes every depth")
+    test.assert(png.is_valid_combination(PngGrey, PngDepth1))
+    test.assert(png.is_valid_combination(PngGrey, PngDepth16))
+
+    test.case("palette takes 1, 2, 4 and 8 and never 16")
+    test.assert(png.is_valid_combination(PngIndexed, PngDepth8))
+    test.assert(png.is_valid_combination(PngIndexed, PngDepth16) == false)
+
+    test.case("the multi-channel types take only 8 and 16")
+    test.assert(png.is_valid_combination(PngTruecolor, PngDepth8))
+    test.assert(png.is_valid_combination(PngTruecolor, PngDepth16))
+    test.assert(png.is_valid_combination(PngTruecolor, PngDepth4) == false)
+    test.assert(png.is_valid_combination(PngGreyAlpha, PngDepth1) == false)
+    test.assert(png.is_valid_combination(PngTruecolorAlpha, PngDepth2) == false)
+
+@test
+fn test_bits_per_pixel_runs_from_one_to_sixty_four() [io]
+    test.case("the smallest pixel PNG has")
+    let tiny = PngInfo { width: 1, height: 1, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+    test.assert(png.bits_per_pixel(tiny) == 1)
+
+    test.case("and the largest")
+    let big = PngInfo { width: 1,
+        height: 1,
+        color: PngTruecolorAlpha,
+        depth: PngDepth16,
+        interlace: PngNoInterlace }
+    test.assert(png.bits_per_pixel(big) == 64)
+
+@test
+fn test_the_filter_stride_is_one_below_eight_bits_a_pixel() [io]
+    test.case("a filter works on BYTES, not on pixels")
+    let tiny = PngInfo { width: 8, height: 1, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+    test.assert(png.filter_stride(tiny) == 1)
+
+    test.case("and on whole pixels above it")
+    let rgba16 = PngInfo { width: 1,
+        height: 1,
+        color: PngTruecolorAlpha,
+        depth: PngDepth16,
+        interlace: PngNoInterlace }
+    test.assert(png.filter_stride(rgba16) == 8)
+
+    let rgb8 = PngInfo { width: 1,
+        height: 1,
+        color: PngTruecolor,
+        depth: PngDepth8,
+        interlace: PngNoInterlace }
+    test.assert(png.filter_stride(rgb8) == 3)
+
+@test
+fn test_a_row_rounds_up_to_a_whole_number_of_bytes() [io]
+    test.case("three 1-bit pixels are one byte with five bits of nothing")
+    let bits = PngInfo { width: 3, height: 1, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+    test.assert(png.bytes_per_row(bits, 3) == 1)
+
+    test.case("and nine of them are two")
+    test.assert(png.bytes_per_row(bits, 9) == 2)
+
+    test.case("truecolour at 8 bits is three bytes a pixel with no rounding")
+    let rgb = PngInfo { width: 8,
+        height: 1,
+        color: PngTruecolor,
+        depth: PngDepth8,
+        interlace: PngNoInterlace }
+    test.assert(png.bytes_per_row(rgb, 8) == 24)
+
+@test
+fn test_the_filtered_size_carries_one_byte_a_row() [io]
+    test.case("two rows of one byte each, plus a filter byte each")
+    let i = PngInfo { width: 3, height: 2, color: PngGrey, depth: PngDepth1, interlace: PngNoInterlace }
+    test.assert(png.filtered_size(i) == 4)
+
+@test
+fn test_the_pass_count_is_one_or_seven() [io]
+    test.case("so a caller's loop is the same code either way")
+    test.assert(png.pass_count(PngNoInterlace) == 1)
+    test.assert(png.pass_count(PngAdam7) == 7)

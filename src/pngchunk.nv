@@ -1,0 +1,489 @@
+// pngchunk.nv — the chunk structure, and the ancillary chunks a
+// reader must be able to meet without choking.
+//
+// EVERY CHUNK HAS THE SAME FOUR PARTS
+//
+//     length   4 bytes, big-endian, of the DATA only
+//     type     4 ASCII letters
+//     data     `length` bytes
+//     crc      4 bytes, big-endian, over the TYPE AND THE DATA
+//
+// The length excludes the type and the CRC; the CRC includes the type
+// and excludes the length.  Those two asymmetries are the whole of
+// chunk framing and they are the two things a hand-written reader gets
+// wrong.
+//
+// THE TYPE'S CASE IS FOUR FLAGS
+//
+// Each letter's fifth bit carries a property, which is what lets a
+// decoder handle a chunk nobody has ever heard of correctly:
+//
+//     byte 0 uppercase → CRITICAL: a decoder that cannot read it must
+//                        stop.  Lowercase → ancillary, skip it.
+//     byte 1 uppercase → public (registered).  Lowercase → private.
+//     byte 2 uppercase → reserved; lowercase means the file uses a
+//                        version of PNG this one does not.
+//     byte 3 uppercase → unsafe to copy: an editor that changed the
+//                        pixels must drop it.  Lowercase → safe.
+//
+// **This is why "the ancillary chunks a reader must not choke on" is
+// not a list.**  A conforming decoder skips EVERY ancillary chunk it
+// does not recognise, including ones registered after it was written,
+// and the four predicates below are how it decides.  The typed readers
+// in this module are a convenience for the handful worth acting on;
+// they are not the contract.
+//
+// WHAT THE TYPED READERS COVER, AND WHY THOSE
+//
+// tRNS, because transparency changes the pixels.  gAMA and cHRM and
+// sRGB, because they change what the pixels MEAN and a viewer that
+// ignores them shows the wrong colours.  pHYs, because a print or a
+// retina asset is the wrong size without it.  tEXt, because it is
+// where a caller's own metadata lives.  tIME, because it is the one
+// piece of provenance PNG carries.  Everything else — iCCP, sPLT,
+// hIST, bKGD, and every private chunk — comes through `PngEvAncillary`
+// as bytes, which is honest: this package will not pretend to parse an
+// ICC profile.
+
+use srgb
+
+// One chunk, as it sits in the file.
+//
+// `kind` is the four-letter type as a `Str` because that is how a
+// person reads it and how every specification and every tool spells
+// it; the case flags are read off it by the four predicates below
+// rather than by a caller slicing bytes.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "tEXt", data: bytes.zeros(0) }
+//     println("${pngchunk.is_critical(c)}")                // false
+// ```
+pub struct PngChunk
+    // The four-letter type, exactly as it appears: `IHDR`, `tEXt`.
+    kind: Str
+    // The chunk's data, without the length, the type or the CRC.
+    data: Bytes
+
+// Whether a decoder that does not understand this chunk must stop.
+//
+// The first letter's case: `IHDR`, `PLTE`, `IDAT` and `IEND` are
+// critical and so is any future chunk whose name starts with a capital.
+// **A decoder meeting an unknown CRITICAL chunk must fail**, because
+// the file is using a feature it does not have — quietly skipping it
+// produces a wrong image rather than an error.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "IHDR", data: bytes.zeros(0) }
+//     println("${pngchunk.is_critical(c)}")                // true
+// ```
+pub fn is_critical(c: PngChunk) -> Bool
+    todo("png-nv.pngchunk.is_critical")
+
+// Whether this chunk type is registered rather than private.
+//
+// The second letter's case.  A private chunk is one an application
+// defined for itself; a decoder treats it exactly as it treats any
+// other ancillary chunk it does not recognise, and this predicate
+// exists so that a TOOL — an inspector, a stripper — can tell the two
+// apart.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "prVt", data: bytes.zeros(0) }
+//     println("${pngchunk.is_public(c)}")                  // false
+// ```
+pub fn is_public(c: PngChunk) -> Bool
+    todo("png-nv.pngchunk.is_public")
+
+// Whether the reserved bit is clear, as every conforming file has it.
+//
+// The third letter's case.  A lower-case third letter means the file
+// uses a version of PNG this specification does not describe, and the
+// only correct response is to refuse the file rather than guess.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "tEXt", data: bytes.zeros(0) }
+//     println("${pngchunk.is_conforming(c)}")              // true
+// ```
+pub fn is_conforming(c: PngChunk) -> Bool
+    todo("png-nv.pngchunk.is_conforming")
+
+// Whether an editor that changed the pixels may keep this chunk.
+//
+// The fourth letter's case.  `tEXt` is safe to copy and `tRNS` is not,
+// because transparency describes the pixels that were there.  A
+// re-encoder that copied every ancillary chunk through would carry a
+// tRNS for a palette it no longer has.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "tRNS", data: bytes.zeros(0) }
+//     println("${pngchunk.is_safe_to_copy(c)}")            // false
+// ```
+pub fn is_safe_to_copy(c: PngChunk) -> Bool
+    todo("png-nv.pngchunk.is_safe_to_copy")
+
+// The CRC-32 of a chunk's type and data.
+//
+// The reflected IEEE polynomial, the same one gzip uses, over the four
+// type bytes FOLLOWED BY the data — and not over the length, which is
+// the asymmetry worth having a function for.
+//
+// It is spelled here rather than taken from flate-nv even though that
+// package has the identical algorithm for its gzip trailer, because
+// this package's dependency on flate-nv is about DEFLATE and a
+// checksum shared across a package boundary for the sake of forty
+// lines would make png-nv's chunk reader depend on a decompressor's
+// release schedule.  The implementation lane may decide otherwise; the
+// interface does not force it either way.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "IEND", data: bytes.zeros(0) }
+//     println("${pngchunk.crc32(c) > 0}")                  // true
+// ```
+pub fn crc32(c: PngChunk) -> Int
+    todo("png-nv.pngchunk.crc32")
+
+// How many bytes this chunk occupies in a file, framing included.
+//
+// `12 + len(data)`: four of length, four of type, four of CRC.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "IEND", data: bytes.zeros(0) }
+//     println("${pngchunk.framed_size(c)}")                // 12
+// ```
+pub fn framed_size(c: PngChunk) -> Int
+    todo("png-nv.pngchunk.framed_size")
+
+// Write a chunk into a caller-supplied buffer, framing and CRC
+// included.
+//
+// Returns the buffer and the offset past what was written.  The CRC is
+// computed here rather than taken as an argument, because a chunk
+// writer that let a caller supply one would let them supply a wrong
+// one.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "IEND", data: bytes.zeros(0) }
+//     let (buf, at) = pngchunk.write(c, bytes.zeros(16), 0)
+//     println("${at}")                                     // 12
+// ```
+pub fn write(c: PngChunk, out: Bytes, at: Int) -> (Bytes, Int)
+    todo("png-nv.pngchunk.write")
+
+// A text chunk's keyword and its text.
+//
+// tEXt, zTXt and iTXt all become this: the keyword is `1 ..= 79`
+// Latin-1 characters and the text is whatever follows it.  A zTXt's
+// text is inflated on the way through and an iTXt's is UTF-8, so a
+// caller sees one type where the file has three encodings — which is
+// the right simplification, because the difference between them is
+// how the bytes were stored and never what they mean.
+//
+// **The `language` and `translated_keyword` of an iTXt are dropped.**
+// That is a real loss and it is deliberate: carrying two more fields
+// that are empty for the ninety-nine per cent of text chunks that are
+// tEXt would put the cost of iTXt on every reader. A caller who needs
+// them reads the raw chunk from `PngEvAncillary`.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let t = PngText { keyword: "Author", text: "a person" }
+//     println("${t.keyword}")                              // Author
+// ```
+pub struct PngText
+    // `1 ..= 79` characters, Latin-1, with a registered set of
+    // conventional values — `Title`, `Author`, `Description`,
+    // `Copyright`, `Software`, `Comment` among them.
+    keyword: Str
+    // The text.  Newlines are LF only; a decoder does not translate.
+    text: Str
+
+// The pHYs chunk: how large a pixel is in the physical world.
+//
+// Two numbers and a unit flag.  When `is_metres` is false the two
+// numbers still carry the aspect RATIO, which is the case that
+// matters: a file may say "these pixels are twice as wide as they are
+// tall" without claiming to know how large either is.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let p = PngPhys { x: 2835, y: 2835, is_metres: true }
+//     println("${p.x}")                                    // 2835
+// ```
+pub struct PngPhys
+    // Pixels per unit, horizontally.
+    x: Int
+    // Pixels per unit, vertically.
+    y: Int
+    // True when the unit is a metre — 2835 per metre is 72 dpi — and
+    // false when there is no unit and only the ratio is meaningful.
+    is_metres: Bool
+
+// The tIME chunk: when the image was last modified, in UTC.
+//
+// PNG's only provenance field, and it is UTC by specification rather
+// than by convention.  It is a struct of integers rather than a
+// `CivilDate` because this is a `core` package with no clock and no
+// calendar dependency, and because a tIME may be nonsense — the field
+// is seven integers a writer chose, and a decoder that refused an
+// impossible date would refuse files that exist.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let t = PngTime { year: 2026, month: 9, day: 10, hour: 0, minute: 0, second: 0 }
+//     println("${t.year}")                                 // 2026
+// ```
+pub struct PngTime
+    // The full year, not an offset from 1900.
+    year: Int
+    // `1 ..= 12`.
+    month: Int
+    // `1 ..= 31`.
+    day: Int
+    // `0 ..= 23`.
+    hour: Int
+    // `0 ..= 59`.
+    minute: Int
+    // `0 ..= 60` — the specification allows a leap second.
+    second: Int
+
+// The sRGB chunk's rendering intent.
+//
+// When this chunk is present the image IS sRGB, and gAMA and cHRM — if
+// they are also there — are redundant and must agree with sRGB's own
+// values.  A viewer that honoured a contradictory gAMA over an sRGB
+// chunk would be wrong.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     println("${pngchunk.intent_byte(PngPerceptual)}")    // 0
+// ```
+pub enum PngSrgbIntent
+    // 0 — perceptual: for photographs, where the whole gamut is
+    // compressed to fit and relative differences are preserved.
+    PngPerceptual
+    // 1 — relative colorimetric: for logos and spot colours, where an
+    // in-gamut colour must be exact.
+    PngRelativeColorimetric
+    // 2 — saturation: for charts, where vividness matters more than
+    // accuracy.
+    PngSaturation
+    // 3 — absolute colorimetric: for proofing, where even the white
+    // point is reproduced.
+    PngAbsoluteColorimetric
+
+// The rendering intent's own number, `0 ..= 3`.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     println("${pngchunk.intent_byte(PngAbsoluteColorimetric)}")   // 3
+// ```
+pub fn intent_byte(i: PngSrgbIntent) -> Int
+    todo("png-nv.pngchunk.intent_byte")
+
+// The tRNS chunk, which means three different things depending on the
+// colour type.
+//
+// This is the ancillary chunk that changes the PIXELS, which is why it
+// is a typed value rather than raw bytes: a decoder that skipped it
+// produces an opaque image where the file said otherwise, and that is
+// a wrong answer rather than a missing one.
+//
+// tRNS is refused entirely for `PngGreyAlpha` and `PngTruecolorAlpha`,
+// where the pixels already carry alpha.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     println("${pngchunk.transparent_count(PngTrnsGrey(0))}")      // 1
+// ```
+pub enum PngTransparency
+    // Greyscale: the one sample value that is fully transparent.
+    // Every other value is opaque — PNG has no partial transparency
+    // outside a palette or an alpha channel.
+    PngTrnsGrey(level: Int)
+    // Truecolour: the one RGB triple that is fully transparent.
+    PngTrnsColor(r: Int, g: Int, b: Int)
+    // Palette: an alpha value per palette entry, in palette order.
+    // The list may be SHORTER than the palette, and every entry it
+    // does not reach is fully opaque — which is the compression this
+    // form exists for and the off-by-one every reader hits.
+    PngTrnsPalette(alphas: [Int])
+
+// How many entries a transparency value describes.
+//
+// One for the grey and colour forms, and the list's length for the
+// palette form — which is not the palette's length, because the list
+// may stop early and everything past it is opaque.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     println("${pngchunk.transparent_count(PngTrnsPalette([255, 0]))}")   // 2
+// ```
+pub fn transparent_count(t: PngTransparency) -> Int
+    todo("png-nv.pngchunk.transparent_count")
+
+// A palette entry with its transparency applied.
+//
+// The join a decoder of an indexed image needs: PLTE gives the colour,
+// tRNS gives the alpha, and an index past the end of tRNS's list is
+// opaque.  Doing it here rather than in every caller is what keeps the
+// short-list rule in one place.
+//
+// `None` when the index is past the palette itself, which is a corrupt
+// file rather than a defaulted one.
+//
+// ```novo
+// use pngchunk
+// use srgb
+//
+// fn main() [io]
+//     let pal = [srgb.black()]
+//     match pngchunk.palette_pixel(pal, PngTrnsPalette([]), 0)
+//         Some(p) => println("${p.a}")                     // 255
+//         None    => println("out of range")
+// ```
+pub fn palette_pixel(palette: [Srgb8], t: PngTransparency, index: Int) -> ?Srgba8
+    todo("png-nv.pngchunk.palette_pixel")
+
+// A text chunk read out of an ancillary chunk.
+//
+// `None` when the chunk is not a `tEXt`, `zTXt` or `iTXt`, and also
+// when it is one of those and is malformed — a keyword longer than 79
+// characters, a missing separator, a `zTXt` whose compressed text does
+// not inflate.  A caller who needs to tell "not a text chunk" from
+// "a broken text chunk" is reading a file that is already damaged; the
+// events carry the raw chunk either way.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "IHDR", data: bytes.zeros(13) }
+//     match pngchunk.read_text(c)
+//         Some(_) => println("text")
+//         None    => println("not a text chunk")           // this one
+// ```
+pub fn read_text(c: PngChunk) -> ?PngText
+    todo("png-nv.pngchunk.read_text")
+
+// A pHYs chunk read out of an ancillary chunk.
+//
+// `None` for any other chunk type, and for a pHYs whose data is not
+// nine bytes.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "pHYs", data: bytes.zeros(9) }
+//     match pngchunk.read_phys(c)
+//         Some(p) => println("${p.x}")                     // 0
+//         None    => println("not a pHYs")
+// ```
+pub fn read_phys(c: PngChunk) -> ?PngPhys
+    todo("png-nv.pngchunk.read_phys")
+
+// A tIME chunk read out of an ancillary chunk.
+//
+// `None` for any other chunk type, and for a tIME whose data is not
+// seven bytes.  The fields are NOT range-checked: a tIME is seven
+// integers a writer chose, files with impossible dates exist, and a
+// reader that refused them would refuse images that are otherwise
+// perfect.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "tIME", data: bytes.zeros(7) }
+//     match pngchunk.read_time(c)
+//         Some(t) => println("${t.month}")                 // 0
+//         None    => println("not a tIME")
+// ```
+pub fn read_time(c: PngChunk) -> ?PngTime
+    todo("png-nv.pngchunk.read_time")
+
+// An sRGB chunk's rendering intent, read out of an ancillary chunk.
+//
+// `None` for any other chunk type, for a one-byte chunk whose byte is
+// above 3, and for an sRGB chunk of any other length.
+//
+// When this answers `Some`, the image IS sRGB and any gAMA or cHRM in
+// the same file is redundant — a viewer that honoured a contradictory
+// gAMA over this would be wrong.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "sRGB", data: bytes.zeros(1) }
+//     match pngchunk.read_srgb_intent(c)
+//         Some(i) => println("${pngchunk.intent_byte(i)}") // 0
+//         None    => println("not an sRGB chunk")
+// ```
+pub fn read_srgb_intent(c: PngChunk) -> ?PngSrgbIntent
+    todo("png-nv.pngchunk.read_srgb_intent")
+
+// A gAMA chunk's gamma, read out of an ancillary chunk.
+//
+// The file stores the image's gamma times 100,000 as an integer; this
+// answers the gamma itself, so a plain sRGB file's 45455 comes back as
+// 0.45455.
+//
+// **That number is the inverse of the exponent** a viewer applies —
+// gAMA records the gamma of the device the image was ENCODED for, and
+// decoding raises to its reciprocal.  Getting that backwards produces
+// an image that is visibly and consistently wrong, which is why the
+// unit is stated here rather than left to a reader to infer.
+//
+// `None` for any other chunk type, for a gAMA whose data is not four
+// bytes, and for a gamma of zero, which has no reciprocal.
+//
+// ```novo
+// use pngchunk
+//
+// fn main() [io]
+//     let c = PngChunk { kind: "gAMA", data: bytes.zeros(4) }
+//     match pngchunk.read_gamma(c)
+//         Some(g) => println("${g}")
+//         None    => println("no usable gamma")            // this one
+// ```
+pub fn read_gamma(c: PngChunk) -> ?Float
+    todo("png-nv.pngchunk.read_gamma")

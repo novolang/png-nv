@@ -1,0 +1,58 @@
+[package]
+name        = "png-nv"
+version     = "0.0.1"
+description = "PNG on its own: the signature, the chunk structure with the four case flags that decide what a reader may skip, IHDR through IEND, all five row filters both directions, every legal colour type and bit depth including palette and 16-bit, Adam7 decoded, and both directions over flate-nv by a decoder that never holds the file."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and the decoder is where the claim is earned.  A PNG is a
+# chunk stream a caller has in a file, and this package will not read
+# one: the host pumps bytes in and takes EVENTS out — header, palette,
+# transparency, one row, end — and the state a decoder carries is
+# bounded by the image's WIDTH rather than its size, because the
+# filters need exactly one row of history.  A 100,000-row photograph
+# decodes in a few hundred kilobytes.
+#
+# The one function that meets a stream stays inside the budget by
+# BINDING its cost rather than spending one:
+# `pngdec.read_all<S: Read[e]>(…) -> … [e]` is charged whatever the
+# caller's impl supplies (SPEC § 5.6).
+layer       = "core"
+
+category    = "graphics"
+
+tags        = ["png", "image", "codec", "lossless", "deflate", "adam7", "sans-io", "encoder", "decoder", "libpng"]
+repository  = "https://github.com/novolang/png-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "PNG, encoded and decoded without ever holding the file"
+
+[dependencies]
+# Every IDAT chain is one zlib stream, so PNG's compression IS
+# DEFLATE — and this package takes the inflater and the deflater from
+# the package that owns them rather than writing a second one.
+# flate-nv is itself an interface at `core`, published as a 0.0.x, so
+# the caret range names exactly that release: under the caret rule a
+# `0.0.x` version has no compatible neighbours.
+flate-nv = "^0.0.2"
+
+# PLTE entries, the bKGD colour and tRNS's palette alphas are colours,
+# so the colour type comes from the package that owns colour.  The
+# PIXEL DATA does not: a row is raw samples in the file's own colour
+# type and depth, because a row of a 4K 16-bit RGBA image is 64 KiB
+# and one value per sample would cost twenty times that.
+#
+# A PATH while this lane and color-nv are developed together; the
+# coordinator converts it to `^0.0.1` before publish.
+color-nv = "^0.0.1"

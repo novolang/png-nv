@@ -1,0 +1,130 @@
+// pngfilter_tests.nv — the API suite for the five filters and for
+// Adam7's pass arithmetic.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See png_tests.nv for why
+// an interface package ships a failing suite.
+//
+// Two things here are binding specification and one is not.  The
+// filters' arithmetic and Adam7's seven-row table are the format.
+// `pngfilter.choose` is libpng's heuristic, so the only assertion made
+// about it is that it answers a filter at all — asserting WHICH one
+// would be a test of an encoder's taste.
+
+use std.test
+use png
+use pngadam7
+use pngfilter
+
+@test
+fn test_paeth_selects_a_neighbour_and_does_not_average_them() [io]
+    test.case("it answers one of its three arguments, always")
+    let p = pngfilter.paeth(10, 20, 30)
+    test.assert(p == 10 or p == 20 or p == 30)
+
+    test.case("three equal neighbours answer that value")
+    test.assert(pngfilter.paeth(7, 7, 7) == 7)
+
+    test.case("and a tie goes to the left neighbour first")
+    test.assert(pngfilter.paeth(1, 1, 0) == 1)
+
+@test
+fn test_the_none_filter_is_the_identity_in_both_directions() [io]
+    test.case("nothing is subtracted, so nothing changes")
+    let row = bytes.zeros(4)
+    test.assert(bytes.len(pngfilter.unfilter_row(PngFilterNone, row, bytes.zeros(0), 1)) == 4)
+    test.assert(bytes.len(pngfilter.filter_row(PngFilterNone, row, bytes.zeros(0), 1)) == 4)
+
+@test
+fn test_a_filter_preserves_the_rows_length() [io]
+    test.case("filtering is per byte, so nothing is added or lost")
+    let row = bytes.zeros(12)
+    let prior = bytes.zeros(12)
+    test.assert(bytes.len(pngfilter.filter_row(PngFilterPaeth, row, prior, 3)) == 12)
+    test.assert(bytes.len(pngfilter.unfilter_row(PngFilterAverage, row, prior, 3)) == 12)
+
+@test
+fn test_the_first_row_of_a_pass_has_no_row_above_it() [io]
+    test.case("an empty prior means the bytes above are zero")
+    let row = bytes.zeros(4)
+    test.assert(bytes.len(pngfilter.unfilter_row(PngFilterUp, row, bytes.zeros(0), 1)) == 4)
+    test.assert(bytes.len(pngfilter.unfilter_row(PngFilterPaeth, row, bytes.zeros(0), 1)) == 4)
+
+@test
+fn test_choose_answers_a_filter_and_nothing_is_asserted_about_which() [io]
+    test.case("the heuristic is libpng's and not the specification's")
+    let f = pngfilter.choose(bytes.zeros(8), bytes.zeros(8), 1)
+    test.assert(pngfilter.filter_byte(f) >= 0 and pngfilter.filter_byte(f) <= 4)
+
+@test
+fn test_the_fixed_filter_default_is_none_for_indexed_and_paeth_otherwise() [io]
+    test.case("a difference between two palette indices means nothing")
+    let pal = PngInfo { width: 4, height: 4, color: PngIndexed, depth: PngDepth8, interlace: PngNoInterlace }
+    test.assert(pngfilter.filter_byte(pngfilter.default_for(pal)) == 0)
+
+    test.case("and a photograph wants Paeth")
+    let rgb = PngInfo { width: 4,
+        height: 4,
+        color: PngTruecolor,
+        depth: PngDepth8,
+        interlace: PngNoInterlace }
+    test.assert(pngfilter.filter_byte(pngfilter.default_for(rgb)) == 4)
+
+@test
+fn test_pass_one_takes_one_pixel_in_sixty_four() [io]
+    test.case("an 8x8 image has one pixel in pass 1")
+    test.assert(pngadam7.pass_width(8, 1) == 1)
+    test.assert(pngadam7.pass_height(8, 1) == 1)
+
+    test.case("and pass 7 has half of it")
+    test.assert(pngadam7.pass_width(8, 7) == 8)
+    test.assert(pngadam7.pass_height(8, 7) == 4)
+
+@test
+fn test_a_small_image_has_empty_passes_that_must_be_skipped() [io]
+    test.case("a 5x5 image has nothing in pass 2")
+    test.assert(pngadam7.pass_is_empty(5, 5, 2))
+
+    test.case("but it does have a pass 1")
+    test.assert(pngadam7.pass_is_empty(5, 5, 1) == false)
+
+    test.case("and a 1x1 image has only pass 1")
+    test.assert(pngadam7.pass_is_empty(1, 1, 1) == false)
+    test.assert(pngadam7.pass_is_empty(1, 1, 7))
+
+@test
+fn test_the_grids_are_the_specifications_offsets_and_strides() [io]
+    test.case("pass 1 starts at the corner and steps eight")
+    let (c1, s1) = pngadam7.column_grid(1)
+    test.assert(c1 == 0 and s1 == 8)
+
+    test.case("pass 2 starts four columns in")
+    let (c2, _) = pngadam7.column_grid(2)
+    test.assert(c2 == 4)
+
+    test.case("pass 7 is every other row, starting at row 1")
+    let (r7, s7) = pngadam7.row_grid(7)
+    test.assert(r7 == 1 and s7 == 2)
+
+@test
+fn test_placing_a_pass_pixel_uses_its_grid() [io]
+    test.case("the first pixel of pass 1 is the corner of the image")
+    let (x, y) = pngadam7.place(1, 0, 0)
+    test.assert(x == 0 and y == 0)
+
+    test.case("the second pixel of pass 1 is eight columns along")
+    let (x2, _) = pngadam7.place(1, 1, 0)
+    test.assert(x2 == 8)
+
+    test.case("and the first pixel of pass 2 is four columns in")
+    let (x3, y3) = pngadam7.place(2, 0, 0)
+    test.assert(x3 == 4 and y3 == 0)
+
+@test
+fn test_interlacing_makes_the_filtered_image_larger() [io]
+    test.case("seven passes carry seven sets of filter bytes")
+    let i = PngInfo { width: 8, height: 8, color: PngGrey, depth: PngDepth8, interlace: PngAdam7 }
+    test.assert(pngadam7.total_filtered_size(i) > png.filtered_size(i))
+
+    test.case("and for a non-interlaced image the two agree")
+    let j = PngInfo { width: 8, height: 8, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    test.assert(pngadam7.total_filtered_size(j) == png.filtered_size(j))

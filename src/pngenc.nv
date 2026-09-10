@@ -1,0 +1,356 @@
+// pngenc.nv — the encoder: rows in, a file out, with the compression
+// left to flate-nv and the choices left to the caller.
+//
+// THE ENCODER IS ROW-AT-A-TIME FOR THE SAME REASON THE DECODER IS
+//
+// A filter refers to the row above, so an encoder needs exactly one
+// row of history and never the image.  `push_row` takes one row of raw
+// samples and returns whatever bytes that completed; a caller
+// generating an image procedurally — a plot, a chart, a render — never
+// holds it.  `encode` is the whole-image convenience and says so.
+//
+// WHAT THE CALLER CHOOSES, AND WHAT THEY DO NOT
+//
+// PNG has exactly one compression method and one filter method, so
+// there is nothing to choose there.  What is left is the DEFLATE level
+// — flate-nv's `FlateLevel`, passed straight through — and the filter
+// strategy, which is this package's own idea of a knob because nothing
+// in PNG says how to pick a filter for a row.  `PngOptions` carries
+// both and nothing else.
+//
+// WHAT AN ENCODER MAY NOT DECIDE FOR ITS CALLER
+//
+// The colour type and bit depth.  An encoder that quantised a
+// truecolour image into a palette because it noticed there were fewer
+// than 256 colours would be making a decision about the caller's data
+// that they did not ask for and cannot undo.  The `PngInfo` a caller
+// hands to `encoder` is honoured exactly; image-nv is where a choice
+// of format happens, and it is a choice a person made.
+//
+// THE ONE THING THIS PACKAGE WILL NOT DO
+//
+// Write an interlaced file.  Adam7 is DECODED here and not encoded,
+// and that asymmetry is deliberate rather than an omission: an
+// interlaced PNG is five to twenty per cent larger than the same image
+// not interlaced, browsers have rendered progressively from a
+// non-interlaced stream for a decade, and the format's own
+// specification calls it optional.  An encoder that offered it would
+// be offering a way to make files worse.  `encoder` refuses a
+// `PngInfo` whose interlace is `PngAdam7`, by returning an encoder
+// that is already failed, and the README says so where a reader will
+// see it before they write the loop.
+
+use flate
+use pngfilter
+use srgb
+
+// What a caller may choose about how a PNG is written.
+//
+// Two fields, because PNG has two degrees of freedom and no more: how
+// hard DEFLATE works, and how a filter is picked for each row.
+// Everything else about a PNG's bytes is fixed by the specification or
+// by the `PngInfo` the caller supplied.
+//
+// ```novo
+// use pngenc
+// use flate
+//
+// fn main() [io]
+//     let o = PngOptions { level: flate.balanced(), fixed_filter: false }
+//     println("${o.level.number}")                         // 6
+// ```
+pub struct PngOptions
+    // The DEFLATE level, flate-nv's own value.  A level rather than a
+    // number, so a call site says what it means:
+    // `flate.smallest()` for an asset that ships, `flate.fastest()`
+    // for a preview.
+    level: FlateLevel
+    // When true, use `pngfilter.default_for` on every row instead of
+    // running the five-way search.  Roughly four times faster to
+    // encode and a few per cent larger; the right choice for a
+    // screenshot, the wrong one for an asset.
+    fixed_filter: Bool
+
+// The options a caller who has no opinion should use.
+//
+// Level 6 — zlib's default, which is what almost every PNG in the
+// world was written at — and the full filter search.
+//
+// ```novo
+// use pngenc
+//
+// fn main() [io]
+//     println("${pngenc.default_options().fixed_filter}")  // false
+// ```
+pub fn default_options() -> PngOptions
+    todo("png-nv.pngenc.default_options")
+
+// An encoder between rows.
+//
+// Carried by value like the decoder, and for the same reason:
+// `push_row` returns the next one.  A failed encoder stays failed and
+// every subsequent call produces nothing.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 4, height: 4, color: PngTruecolor, depth: PngDepth8, interlace: PngNoInterlace }
+//     println("${pngenc.rows_in(pngenc.encoder(i, pngenc.default_options()))}")   // 0
+// ```
+pub struct PngEncoder
+    // The image being written.  Fixed for the encoder's life.
+    info: PngInfo
+    // The level and the filter strategy.
+    options: PngOptions
+    // Rows taken so far.
+    rows_in: Int
+    // Bytes produced so far, signature and chunks included.
+    produced: Int
+    // The previous RAW row, which the filters refer back to — raw and
+    // not filtered, which is the asymmetry between the two directions.
+    prior: Bytes
+    // The deflater over the IDAT chain, as a value.
+    deflater: Deflater
+    // The sticky failure, or absent.
+    failure: ?PngError
+
+// An encoder for this image, with these options.
+//
+// Nothing is written yet — `start` writes the signature and IHDR.
+//
+// **An interlaced `PngInfo` is refused**: the encoder comes back
+// already failed with `PngBadInterlaceMethod`, and `error` says so.
+// This package decodes Adam7 and does not write it; the module header
+// gives the argument.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngAdam7 }
+//     match pngenc.error(pngenc.encoder(i, pngenc.default_options()))
+//         Some(_) => println("refused")                    // this one
+//         None    => println("accepted")
+// ```
+pub fn encoder(i: PngInfo, o: PngOptions) -> PngEncoder
+    todo("png-nv.pngenc.encoder")
+
+// Write the signature and the IHDR chunk.
+//
+// Returns the encoder and the bytes.  Separate from `encoder` so that
+// a caller can build the encoder, ask it whether the image was
+// accepted, and only then start producing bytes.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, out) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     println("${bytes.len(out)}")                         // 33
+// ```
+pub fn start(e: PngEncoder) -> (PngEncoder, Bytes)
+    todo("png-nv.pngenc.start")
+
+// Write a palette chunk.
+//
+// Required before any row for an indexed image and refused after the
+// first row for any image.  A palette longer than 256 entries is
+// refused; a palette on a greyscale image is refused.
+//
+// ```novo
+// use pngenc
+// use png
+// use srgb
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngIndexed, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     let (e2, out) = pngenc.write_palette(e, [srgb.black(), srgb.white()])
+//     println("${bytes.len(out)}")                         // 18
+// ```
+pub fn write_palette(e: PngEncoder, colors: [Srgb8]) -> (PngEncoder, Bytes)
+    todo("png-nv.pngenc.write_palette")
+
+// Write a transparency chunk.
+//
+// Refused for a colour type that already carries alpha, and refused
+// after the first row.  For an indexed image it must follow the
+// palette.
+//
+// ```novo
+// use pngenc
+// use png
+// use srgb
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngIndexed, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     let (e2, _) = pngenc.write_palette(e, [srgb.black()])
+//     let (e3, out) = pngenc.write_transparency(e2, PngTrnsPalette([0]))
+//     println("${bytes.len(out)}")                         // 13
+// ```
+pub fn write_transparency(e: PngEncoder, t: PngTransparency) -> (PngEncoder, Bytes)
+    todo("png-nv.pngenc.write_transparency")
+
+// Write an ancillary chunk of the caller's own.
+//
+// The counterpart of `PngEvAncillary`: a caller who wants a gAMA, a
+// pHYs, a tEXt or a private chunk builds it and hands it over, and
+// this package neither parses it nor checks it beyond the four case
+// flags.  A CRITICAL chunk is refused — a caller cannot invent one
+// without inventing a version of PNG — and so is any chunk after the
+// first row, because everything except IEND has to precede IDAT or be
+// one of the small set that may follow it.
+//
+// ```novo
+// use pngenc
+// use png
+// use pngchunk
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     let c = PngChunk { kind: "tEXt", data: bytes.zeros(4) }
+//     let (e2, out) = pngenc.write_chunk(e, c)
+//     println("${bytes.len(out)}")                         // 16
+// ```
+pub fn write_chunk(e: PngEncoder, c: PngChunk) -> (PngEncoder, Bytes)
+    todo("png-nv.pngenc.write_chunk")
+
+// Hand the encoder one row of raw samples.
+//
+// The row is in the image's own colour type and bit depth, `width`
+// pixels wide, with no filter byte — this package chooses the filter
+// and writes the byte.  Rows go in top to bottom and there is no other
+// order.
+//
+// **This usually returns few bytes or none.**  DEFLATE holds input
+// back to find matches in it, so a row's bytes typically appear
+// several rows later, and a caller must not treat an empty return as
+// an error or stop before `finish`.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     let (e2, out) = pngenc.push_row(e, bytes.zeros(2))
+//     println("${pngenc.rows_in(e2)}")                     // 1
+// ```
+pub fn push_row(e: PngEncoder, row: Bytes) -> (PngEncoder, Bytes)
+    todo("png-nv.pngenc.push_row")
+
+// Hand the encoder a row and say which filter to use for it.
+//
+// The escape from the strategy in `PngOptions`, for a caller who knows
+// something about their data that a heuristic cannot — a chart with
+// long flat runs wants `PngFilterUp`, a palette image wants
+// `PngFilterNone`, and a re-encoder preserving another file's choices
+// wants exactly what that file said.
+//
+// ```novo
+// use pngenc
+// use png
+// use pngfilter
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     let (e2, _) = pngenc.push_row_with(e, bytes.zeros(2), PngFilterNone)
+//     println("${pngenc.rows_in(e2)}")                     // 1
+// ```
+pub fn push_row_with(e: PngEncoder, row: Bytes, f: PngFilter) -> (PngEncoder, Bytes)
+    todo("png-nv.pngenc.push_row_with")
+
+// Close the file: flush the deflater, write the last IDAT and IEND.
+//
+// Not optional.  An encoder holding compressed bytes back has not
+// written them, and a file without IEND is one every decoder
+// complains about.
+//
+// `Err` when the row count does not match the image height, which is
+// the one thing an encoder can check that a decoder cannot fix.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+//     match pngenc.finish(e)
+//         Ok(_)  => println("closed")
+//         Err(_) => println("wrong number of rows")        // this one
+// ```
+pub fn finish(e: PngEncoder) -> Result<Bytes, PngError>
+    todo("png-nv.pngenc.finish")
+
+// The sticky failure, if the encoder has one.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     match pngenc.error(pngenc.encoder(i, pngenc.default_options()))
+//         Some(_) => println("already bad")
+//         None    => println("clean")                      // this one
+// ```
+pub fn error(e: PngEncoder) -> ?PngError
+    todo("png-nv.pngenc.error")
+
+// How many rows have been pushed.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     println("${pngenc.rows_in(pngenc.encoder(i, pngenc.default_options()))}")   // 0
+// ```
+pub fn rows_in(e: PngEncoder) -> Int
+    todo("png-nv.pngenc.rows_in")
+
+// How many bytes have been produced, signature and chunks included.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     println("${pngenc.total_out(pngenc.encoder(i, pngenc.default_options()))}")  // 0
+// ```
+pub fn total_out(e: PngEncoder) -> Int
+    todo("png-nv.pngenc.total_out")
+
+// Encode a whole image held in memory.
+//
+// The counterpart of `pngdec.decode`: an image description, a flat
+// buffer of raw samples in raster order at that description's colour
+// type and depth, and a whole file comes back.
+//
+// It requires the whole image in memory, which is what the row
+// encoder exists to avoid — so the choice between them is a real one.
+//
+// ```novo
+// use pngenc
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+//     match pngenc.encode(i, bytes.zeros(4), pngenc.default_options())
+//         Ok(_)  => println("encoded")                     // this one
+//         Err(_) => println("refused")
+// ```
+pub fn encode(i: PngInfo, samples: Bytes, o: PngOptions) -> Result<Bytes, PngError>
+    todo("png-nv.pngenc.encode")

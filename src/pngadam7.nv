@@ -1,0 +1,173 @@
+// pngadam7.nv — Adam7 interlacing: seven passes over a repeating 8×8
+// grid, and the arithmetic that places their pixels.
+//
+// ADAM7 IS SUPPORTED, NOT REFUSED
+//
+// The brief for this interface allowed an explicit refusal with a
+// reason.  This package takes the other option, for three reasons
+// worth writing down:
+//
+//   * Interlaced PNGs exist in the wild and a decoder that refused
+//     them would be a decoder that fails on real files.  A codec's
+//     value is in the files it can read.
+//   * The arithmetic is a table of seven rows.  It is fiddly and it is
+//     small, and nothing about it is open-ended the way JPEG's
+//     progressive mode is.
+//   * The place it costs something is the DECODER'S SHAPE, and that
+//     cost is paid whether or not this package supports it: a
+//     streaming decoder has to admit that rows do not arrive in raster
+//     order, and a `PngEvRow` that did not carry a pass number would
+//     have shut the door on interlacing for good.  Having decided to
+//     carry the pass, supporting the passes is nearly free.
+//
+// THE SEVEN PASSES
+//
+// Each pass takes the pixels at one set of positions in every 8×8
+// block.  The digit in this grid is the pass — 1-based, as the
+// specification numbers them — that carries the pixel at that
+// position:
+//
+//     1 6 4 6 2 6 4 6
+//     7 7 7 7 7 7 7 7
+//     5 6 5 6 5 6 5 6
+//     7 7 7 7 7 7 7 7
+//     3 6 3 6 3 6 3 6
+//     7 7 7 7 7 7 7 7
+//     5 6 5 6 5 6 5 6
+//     7 7 7 7 7 7 7 7
+//
+// Pass 7 is half the image, pass 6 a quarter, pass 5 an eighth, and
+// pass 1 one pixel in sixty-four.  That is what makes an interlaced
+// PNG appear at low resolution first, and it is also what makes one
+// LARGER than the same image not interlaced: seven small images
+// compress worse than one large one, typically by five to twenty per
+// cent.
+//
+// EACH PASS IS A COMPLETE SMALL IMAGE
+//
+// This is the fact everything else follows from.  A pass has its own
+// width and height, its own rows, its OWN FILTER BYTE PER ROW, and its
+// filters refer to neighbours WITHIN THE PASS — the pixel "above" in
+// pass 3 is eight image rows up.  A decoder that filtered across pass
+// boundaries would produce a picture that is almost right, which is
+// the worst kind of wrong.
+//
+// A pass whose width or height works out to zero is SKIPPED ENTIRELY:
+// it contributes no rows and no filter bytes at all.  For a 5×5 image
+// three of the seven passes are empty, and an encoder that emitted a
+// zero-length row for them produces a file no decoder can read.
+
+use png
+
+// How wide a pass is, in pixels, for an image of this width.
+//
+// `pass_no` is 1-based, as the specification numbers them.  The answer
+// may be 0, which means the pass is skipped entirely rather than
+// carrying an empty row.
+//
+// ```novo
+// use pngadam7
+//
+// fn main() [io]
+//     println("${pngadam7.pass_width(8, 1)}")              // 1
+// ```
+pub fn pass_width(width: Int, pass_no: Int) -> Int
+    todo("png-nv.pngadam7.pass_width")
+
+// How tall a pass is, in rows, for an image of this height.
+//
+// May be 0, with the same meaning as a zero width.
+//
+// ```novo
+// use pngadam7
+//
+// fn main() [io]
+//     println("${pngadam7.pass_height(8, 7)}")             // 4
+// ```
+pub fn pass_height(height: Int, pass_no: Int) -> Int
+    todo("png-nv.pngadam7.pass_height")
+
+// Whether a pass has any pixels in it for these dimensions.
+//
+// The predicate a decoder's and an encoder's loop both need, because a
+// pass with no pixels contributes no rows and no filter bytes and must
+// be stepped over rather than emitted empty.  For a 5×5 image, passes
+// 2, 4 and 6 are empty.
+//
+// ```novo
+// use pngadam7
+//
+// fn main() [io]
+//     println("${pngadam7.pass_is_empty(5, 5, 2)}")        // true
+// ```
+pub fn pass_is_empty(width: Int, height: Int, pass_no: Int) -> Bool
+    todo("png-nv.pngadam7.pass_is_empty")
+
+// Where a pixel of a pass sits in the whole image.
+//
+// `px` and `py` are the column and row WITHIN the pass; the result is
+// the column and row in the image.  This is the function a caller
+// composing passes into a canvas calls, and it is the only place the
+// 8×8 grid's offsets and strides appear.
+//
+// ```novo
+// use pngadam7
+//
+// fn main() [io]
+//     let (x, y) = pngadam7.place(1, 0, 0)
+//     println("${x}")                                      // 0
+// ```
+pub fn place(pass_no: Int, px: Int, py: Int) -> (Int, Int)
+    todo("png-nv.pngadam7.place")
+
+// The column offset and stride of a pass within the 8×8 grid.
+//
+// Pass 1 starts at column 0 and steps 8; pass 2 at column 4 and steps
+// 8; pass 7 at column 0 and steps 1.  Exposed so that a caller writing
+// their own composition loop can hoist the arithmetic out of it rather
+// than calling `place` per pixel.
+//
+// ```novo
+// use pngadam7
+//
+// fn main() [io]
+//     let (off, step) = pngadam7.column_grid(2)
+//     println("${off}")                                    // 4
+// ```
+pub fn column_grid(pass_no: Int) -> (Int, Int)
+    todo("png-nv.pngadam7.column_grid")
+
+// The row offset and stride of a pass within the 8×8 grid.
+//
+// ```novo
+// use pngadam7
+//
+// fn main() [io]
+//     let (off, step) = pngadam7.row_grid(7)
+//     println("${off}")                                    // 1
+// ```
+pub fn row_grid(pass_no: Int) -> (Int, Int)
+    todo("png-nv.pngadam7.row_grid")
+
+// How many bytes the whole interlaced image occupies as filtered rows.
+//
+// The sum over the seven passes of `pass_height * (bytes_per_row + 1)`,
+// skipping the empty ones.  This is the size of the zlib stream's
+// plaintext for an interlaced image, and it is NOT
+// `png.filtered_size` — it is larger, because seven passes carry seven
+// sets of filter bytes and each pass's rows round up to a whole number
+// of bytes independently.
+//
+// For a non-interlaced image this answers `png.filtered_size`, so a
+// caller's allocation is one call either way.
+//
+// ```novo
+// use pngadam7
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 8, height: 8, color: PngGrey, depth: PngDepth8, interlace: PngAdam7 }
+//     println("${pngadam7.total_filtered_size(i) > png.filtered_size(i)}")  // true
+// ```
+pub fn total_filtered_size(i: PngInfo) -> Int
+    todo("png-nv.pngadam7.total_filtered_size")

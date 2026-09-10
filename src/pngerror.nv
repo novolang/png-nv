@@ -1,0 +1,208 @@
+// pngerror.nv — every way a PNG can refuse to be read or written, and
+// where in the file it happened.
+//
+// WHY EVERY VARIANT CARRIES AN OFFSET
+//
+// A PNG is not a thing a person edited, so a line number has no
+// meaning.  What a person debugging one has is a byte offset they can
+// `xxd -s` to, and a decoder that reported a reason without one has
+// told them to bisect the file by hand.  Offsets are counted from the
+// first byte of the file across every chunk fed, because a caller
+// feeding 64 KiB at a time does not know where a chunk started either.
+//
+// THE THREE FAMILIES
+//
+// A PNG can be wrong in three unrelated ways, and the variants are
+// grouped so that a caller matching on them can tell which:
+//
+//   * The FRAMING is wrong — the signature, a chunk length, a CRC,
+//     the order chunks appear in.  The file is damaged or is not a
+//     PNG.
+//   * The IMAGE DESCRIPTION is wrong — a colour type and bit depth
+//     that cannot appear together, a zero dimension, a palette a
+//     colour type does not admit.  The file was written by something
+//     that does not conform.
+//   * The DATA is wrong — the zlib stream failed, a filter byte is
+//     above 4, the inflated bytes do not fill the rows the header
+//     promised.  This is the family that carries a `FlateError`
+//     through, unmodified, because png-nv has nothing to add to what
+//     the decompressor said.
+//
+// A CRC MISMATCH IS NOT ALWAYS FATAL
+//
+// Every chunk carries a CRC, so unlike QOI a PNG can say that its
+// bytes are damaged rather than decoding them into a plausible
+// picture.  But a bad CRC on an ANCILLARY chunk is recoverable: the
+// chunk is skippable by definition, and refusing the file over a
+// corrupt tEXt would throw away an image that is intact.
+// `is_recoverable` is that distinction, and `pngdec.with_strict` is
+// how a caller who wants every CRC enforced says so.
+
+// Why a PNG could not be read, or written.
+//
+// The names are prefixed `Png…` because a variant constructor resolves
+// by NAME across the whole assembly rather than by the type an
+// expression requires, so an unprefixed `BadSignature` here would
+// collide with the first other format that wanted one.
+//
+// ```novo
+// use pngerror
+//
+// fn main() [io]
+//     println("${pngerror.offset_of(PngBadSignature(0))}") // 0
+// ```
+pub enum PngError
+    // The first eight bytes were not PNG's signature.  No `saw` value:
+    // eight bytes do not fit an `Int`, and the useful diagnosis is
+    // which of the four transfer hazards the signature tests for was
+    // tripped — which `Error.message` reports and a caller reads.
+    PngBadSignature(offset: Int)
+    // Fewer than eight bytes, so the signature could not even be
+    // compared.  Distinct from a bad signature because the file may be
+    // a PNG that was cut short at the very start.
+    PngTruncatedSignature(offset: Int, len: Int)
+    // A chunk whose declared length runs past the end of the data, or
+    // past the 2^31 - 1 the specification caps a chunk at.
+    PngBadChunkLength(offset: Int, len: Int)
+    // A chunk whose CRC does not match its type and data.  `kind` is
+    // carried because whether this is fatal depends on it: a critical
+    // chunk is, an ancillary one is not.
+    PngBadChunkCrc(offset: Int, kind: Str, want: Int, got: Int)
+    // A chunk whose four type bytes are not all ASCII letters.
+    PngBadChunkType(offset: Int)
+    // A critical chunk this decoder does not know.  The file uses a
+    // feature this package does not have, and skipping it would
+    // produce a wrong image rather than an error.
+    PngUnknownCriticalChunk(offset: Int, kind: Str)
+    // A chunk in a place the specification does not allow it: a PLTE
+    // after the first IDAT, a second IHDR, a tRNS before PLTE.
+    PngChunkOutOfOrder(offset: Int, kind: Str)
+    // The file ended without an IEND chunk.  Separate from a
+    // truncation because the image may be complete and only the
+    // framing missing.
+    PngMissingIend(offset: Int)
+    // Bytes after IEND.  A PNG has exactly one image and nothing
+    // follows it.
+    PngTrailingBytes(offset: Int, count: Int)
+    // A colour type byte that is not 0, 2, 3, 4 or 6.
+    PngBadColorType(offset: Int, saw: Int)
+    // A bit depth byte that is not 1, 2, 4, 8 or 16.
+    PngBadBitDepth(offset: Int, saw: Int)
+    // A colour type and bit depth that are each legal and may not
+    // appear together — a 16-bit palette, a 1-bit truecolour.  Both
+    // are carried, because the message has to name the pair.
+    PngBadColorDepthPair(offset: Int, color: Int, depth: Int)
+    // An interlace byte that is not 0 or 1.
+    PngBadInterlaceMethod(offset: Int, saw: Int)
+    // A compression or filter method byte that is not 0.  PNG defines
+    // exactly one of each and reserves the rest; a file using another
+    // is from a future nobody has written.
+    PngBadMethod(offset: Int, kind: Str, saw: Int)
+    // A width or height of zero.  The specification makes both
+    // non-zero, and an image with no pixels has no IDAT that could be
+    // correct.
+    PngZeroDimension(offset: Int, width: Int, height: Int)
+    // Dimensions whose product does not fit the arithmetic this
+    // package does on it.  PNG's fields hold up to 2^31 - 1 in each
+    // direction; the product of two of those is not a size any buffer
+    // can be allocated from, so the refusal is here, once.
+    PngImageTooLarge(offset: Int, width: Int, height: Int)
+    // An indexed image with no PLTE chunk, or a greyscale image with
+    // one.  PLTE is required for colour type 3, optional and
+    // advisory for 2 and 6, and forbidden for 0 and 4.
+    PngPaletteInvalid(offset: Int, reason: Str)
+    // A palette with no entries, more than 256, or a length that is
+    // not a multiple of three.
+    PngBadPaletteSize(offset: Int, len: Int)
+    // A tRNS chunk that does not match its colour type: any tRNS on an
+    // image that already has an alpha channel, a palette tRNS longer
+    // than the palette, a grey tRNS of the wrong length.
+    PngBadTransparency(offset: Int, reason: Str)
+    // The zlib stream under the IDAT chain failed.  The decompressor's
+    // own error, unmodified — png-nv has nothing to add to "the
+    // Huffman table is incomplete", and a caller debugging one wants
+    // flate-nv's offset into the compressed stream as well as this
+    // one's into the file.
+    PngDeflateFailed(offset: Int, cause: FlateError)
+    // A filter byte above 4.  Usually the first sign that a zlib
+    // stream inflated to something that is not image data.
+    PngBadFilterType(offset: Int, saw: Int)
+    // The inflated data did not fill the rows the header promised.
+    // `want` and `got` are byte counts of the FILTERED image, filter
+    // bytes included, because that is the number both sides of the
+    // comparison are in.
+    PngShortImageData(offset: Int, want: Int, got: Int)
+    // More inflated data than the rows the header promised.  Stopping
+    // here rather than growing the output is what keeps a hostile file
+    // from turning a small IDAT into an unbounded allocation.
+    PngExtraImageData(offset: Int, want: Int)
+    // No IDAT chunk at all.  A file with a header and no pixels.
+    PngNoImageData(offset: Int)
+    // The encoder's output buffer ran out.  Only an encoder produces
+    // this, and only a caller who sized their own buffer can see it.
+    PngBufferTooSmall(offset: Int, need: Int, have: Int)
+    // The stream underneath `pngdec.read_all` failed.  The host's
+    // error, unmodified: this package does not know what a socket
+    // timing out means to the program that opened it.
+    PngSourceFailed(cause: IoError)
+
+// `Result<T, PngError>` requires this impl — SPEC § 3.4 makes `Error`
+// the bound on a result's error type — so it exists whether or not an
+// interface release has anything to say yet.
+impl Error for PngError
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("png-nv.PngError.message")
+
+// The 0-based offset into the file the error is about, or `-1` when it
+// is not about a place.
+//
+// `PngSourceFailed` is the only one with no offset: the transport gave
+// up before the decoder saw a byte to blame.
+//
+// ```novo
+// use pngerror
+//
+// fn main() [io]
+//     println("${pngerror.offset_of(PngSourceFailed(IoNotFound))}")     // -1
+// ```
+pub fn offset_of(e: PngError) -> Int
+    todo("png-nv.pngerror.offset_of")
+
+// Whether the image can still be decoded despite this error.
+//
+// True for a bad CRC on an ANCILLARY chunk, an unknown ancillary
+// chunk, a missing IEND and trailing bytes — every case where the
+// pixels are intact and the framing or the metadata is not.  False for
+// everything else.
+//
+// This is the predicate `pngdec.with_strict` inverts: lenient is the
+// default, because a corrupt tEXt should not cost a caller their
+// image, and a caller archiving files wants every CRC enforced and
+// says so.
+//
+// ```novo
+// use pngerror
+//
+// fn main() [io]
+//     println("${pngerror.is_recoverable(PngMissingIend(1024))}")       // true
+// ```
+pub fn is_recoverable(e: PngError) -> Bool
+    todo("png-nv.pngerror.is_recoverable")
+
+// Whether more bytes could help.
+//
+// True for the truncation cases and for a source failure — the rest of
+// the file might arrive.  False for a corrupt chunk, an impossible
+// header, a filter byte above 4.  The one question a caller deciding
+// whether to RETRY is asking, and it is deliberately coarser than
+// `is_recoverable`, which is about salvaging what is already here.
+//
+// ```novo
+// use pngerror
+//
+// fn main() [io]
+//     println("${pngerror.needs_more_bytes(PngBadFilterType(99, 7))}")  // false
+// ```
+pub fn needs_more_bytes(e: PngError) -> Bool
+    todo("png-nv.pngerror.needs_more_bytes")

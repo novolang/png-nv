@@ -1,0 +1,170 @@
+// pngchunk_tests.nv — the API suite for chunk framing, the four case
+// flags, and the typed readers over the ancillary chunks.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See png_tests.nv for why
+// an interface package ships a failing suite.
+//
+// The case flags are what a decoder uses to handle a chunk nobody has
+// ever heard of, so they are the assertions worth making most
+// carefully: the four predicates are read off four letters and every
+// one of them is checked here against a chunk that answers yes and one
+// that answers no.
+
+use std.test
+use pngchunk
+use pngfilter
+use srgb
+
+@test
+fn test_the_critical_flag_is_the_first_letters_case() [io]
+    test.case("the four critical chunks")
+    test.assert(pngchunk.is_critical(PngChunk { kind: "IHDR", data: bytes.zeros(0) }))
+    test.assert(pngchunk.is_critical(PngChunk { kind: "PLTE", data: bytes.zeros(0) }))
+    test.assert(pngchunk.is_critical(PngChunk { kind: "IDAT", data: bytes.zeros(0) }))
+    test.assert(pngchunk.is_critical(PngChunk { kind: "IEND", data: bytes.zeros(0) }))
+
+    test.case("and an ancillary one")
+    test.assert(pngchunk.is_critical(PngChunk { kind: "tEXt", data: bytes.zeros(0) }) == false)
+
+@test
+fn test_the_other_three_flags_are_the_other_three_letters() [io]
+    test.case("public is the second letter")
+    test.assert(pngchunk.is_public(PngChunk { kind: "tEXt", data: bytes.zeros(0) }))
+    test.assert(pngchunk.is_public(PngChunk { kind: "prVt", data: bytes.zeros(0) }) == false)
+
+    test.case("conforming is the third, and every real file has it upper-case")
+    test.assert(pngchunk.is_conforming(PngChunk { kind: "tEXt", data: bytes.zeros(0) }))
+    test.assert(pngchunk.is_conforming(PngChunk { kind: "teat", data: bytes.zeros(0) }) == false)
+
+    test.case("safe-to-copy is the fourth, and tRNS is not")
+    test.assert(pngchunk.is_safe_to_copy(PngChunk { kind: "tEXt", data: bytes.zeros(0) }))
+    test.assert(pngchunk.is_safe_to_copy(PngChunk { kind: "tRNS", data: bytes.zeros(0) }) == false)
+
+@test
+fn test_the_framing_is_twelve_bytes_plus_the_data() [io]
+    test.case("four of length, four of type, four of CRC")
+    test.assert(pngchunk.framed_size(PngChunk { kind: "IEND", data: bytes.zeros(0) }) == 12)
+    test.assert(pngchunk.framed_size(PngChunk { kind: "IHDR", data: bytes.zeros(13) }) == 25)
+
+@test
+fn test_writing_a_chunk_advances_by_its_framed_size() [io]
+    test.case("the empty IEND")
+    let c = PngChunk { kind: "IEND", data: bytes.zeros(0) }
+    let (buf, at) = pngchunk.write(c, bytes.zeros(32), 0)
+    test.assert(at == pngchunk.framed_size(c))
+
+    test.case("the length field carries the DATA length and not the framing")
+    test.assert(bytes.byte_at(buf, 3) == Some(0))
+
+    test.case("and the type follows it")
+    test.assert(bytes.byte_at(buf, 4) == Some('I'))
+
+@test
+fn test_the_crc_covers_the_type_and_the_data_and_not_the_length() [io]
+    test.case("two chunks with the same data and different types differ")
+    let a = PngChunk { kind: "tEXt", data: bytes.zeros(4) }
+    let b = PngChunk { kind: "zTXt", data: bytes.zeros(4) }
+    test.assert(pngchunk.crc32(a) != pngchunk.crc32(b))
+
+    test.case("and the same chunk twice does not")
+    test.assert(pngchunk.crc32(a) == pngchunk.crc32(a))
+
+@test
+fn test_the_rendering_intents_are_zero_to_three() [io]
+    test.case("in the specification's order")
+    test.assert(pngchunk.intent_byte(PngPerceptual) == 0)
+    test.assert(pngchunk.intent_byte(PngRelativeColorimetric) == 1)
+    test.assert(pngchunk.intent_byte(PngSaturation) == 2)
+    test.assert(pngchunk.intent_byte(PngAbsoluteColorimetric) == 3)
+
+@test
+fn test_transparency_counts_what_it_describes_and_not_the_palette() [io]
+    test.case("the grey and colour forms describe one value")
+    test.assert(pngchunk.transparent_count(PngTrnsGrey(0)) == 1)
+    test.assert(pngchunk.transparent_count(PngTrnsColor(255, 0, 255)) == 1)
+
+    test.case("and the palette form describes as many as its list holds")
+    test.assert(pngchunk.transparent_count(PngTrnsPalette([255, 128, 0])) == 3)
+    test.assert(pngchunk.transparent_count(PngTrnsPalette([])) == 0)
+
+@test
+fn test_a_palette_index_past_the_transparency_list_is_opaque() [io]
+    test.case("the short-list rule, which is the off-by-one every reader hits")
+    let pal = [srgb.black(), srgb.white()]
+    match pngchunk.palette_pixel(pal, PngTrnsPalette([0]), 1)
+        Some(p) => test.assert(p.a == 255)
+        None    => test.fail("index 1 is inside a two-entry palette")
+
+    test.case("and an index the list does reach takes its alpha")
+    match pngchunk.palette_pixel(pal, PngTrnsPalette([0]), 0)
+        Some(p) => test.assert(p.a == 0)
+        None    => test.fail("index 0 is inside a two-entry palette")
+
+@test
+fn test_a_palette_index_past_the_palette_is_no_pixel_at_all() [io]
+    test.case("a corrupt file rather than a defaulted one")
+    match pngchunk.palette_pixel([srgb.black()], PngTrnsPalette([]), 7)
+        Some(_) => test.fail("index 7 was read out of a one-entry palette")
+        None    => test.assert(true)
+
+@test
+fn test_the_typed_readers_answer_none_for_the_wrong_chunk() [io]
+    test.case("an IHDR is not a text chunk, a pHYs, a tIME or an sRGB")
+    let ihdr = PngChunk { kind: "IHDR", data: bytes.zeros(13) }
+    match pngchunk.read_text(ihdr)
+        Some(_) => test.fail("an IHDR read as text")
+        None    => test.assert(true)
+    match pngchunk.read_phys(ihdr)
+        Some(_) => test.fail("an IHDR read as pHYs")
+        None    => test.assert(true)
+    match pngchunk.read_time(ihdr)
+        Some(_) => test.fail("an IHDR read as tIME")
+        None    => test.assert(true)
+    match pngchunk.read_srgb_intent(ihdr)
+        Some(_) => test.fail("an IHDR read as sRGB")
+        None    => test.assert(true)
+
+@test
+fn test_a_gamma_of_zero_has_no_reciprocal_and_is_refused() [io]
+    test.case("four zero bytes are a gAMA that says nothing usable")
+    match pngchunk.read_gamma(PngChunk { kind: "gAMA", data: bytes.zeros(4) })
+        Some(_) => test.fail("a gamma of zero was accepted")
+        None    => test.assert(true)
+
+@test
+fn test_a_phys_of_the_wrong_length_is_refused() [io]
+    test.case("nine bytes or nothing")
+    match pngchunk.read_phys(PngChunk { kind: "pHYs", data: bytes.zeros(4) })
+        Some(_) => test.fail("a four-byte pHYs was read")
+        None    => test.assert(true)
+
+    test.case("and a nine-byte one is read")
+    match pngchunk.read_phys(PngChunk { kind: "pHYs", data: bytes.zeros(9) })
+        Some(p) => test.assert(p.is_metres == false)
+        None    => test.fail("a nine-byte pHYs was refused")
+
+@test
+fn test_a_time_is_read_without_being_range_checked() [io]
+    test.case("files with impossible dates exist and are otherwise perfect")
+    match pngchunk.read_time(PngChunk { kind: "tIME", data: bytes.zeros(7) })
+        Some(t) => test.assert(t.month == 0)
+        None    => test.fail("a seven-byte tIME was refused")
+
+@test
+fn test_the_filter_bytes_are_zero_to_four_and_nothing_else() [io]
+    test.case("the five filters, in the specification's order")
+    test.assert(pngfilter.filter_byte(PngFilterNone) == 0)
+    test.assert(pngfilter.filter_byte(PngFilterSub) == 1)
+    test.assert(pngfilter.filter_byte(PngFilterUp) == 2)
+    test.assert(pngfilter.filter_byte(PngFilterAverage) == 3)
+    test.assert(pngfilter.filter_byte(PngFilterPaeth) == 4)
+
+    test.case("and a byte above 4 names no filter — the corrupt case")
+    match pngfilter.filter_of(5)
+        Some(_) => test.fail("5 was read as a filter")
+        None    => test.assert(true)
+
+    test.case("while 0 does name one")
+    match pngfilter.filter_of(0)
+        Some(f) => test.assert(pngfilter.filter_byte(f) == 0)
+        None    => test.fail("0 is PngFilterNone")

@@ -1,0 +1,214 @@
+// pngfilter.nv — the five row filters, both directions, and the
+// heuristic that chooses one.
+//
+// WHAT A FILTER IS FOR
+//
+// DEFLATE compresses repetition, and a photograph has almost none: two
+// neighbouring pixels are usually CLOSE and almost never equal.  A
+// filter turns "close" into "small", by storing each byte as its
+// difference from a neighbour, and a stream of small numbers is what
+// DEFLATE is good at.  Filtering typically halves a photographic PNG
+// and costs one byte per row.
+//
+// THE FIVE, IN THE SPECIFICATION'S ORDER
+//
+// With `x` the byte being coded, `a` the byte one PIXEL to the left,
+// `b` the byte directly above, and `c` the byte above-left:
+//
+//     0  None      x
+//     1  Sub       x - a
+//     2  Up        x - b
+//     3  Average   x - floor((a + b) / 2)
+//     4  Paeth     x - paeth(a, b, c)
+//
+// **Every one of those is modulo 256 on BYTES, not on pixels and not
+// on samples.**  At 16 bits per sample the two halves of a sample are
+// filtered separately and the arithmetic never carries between them —
+// which looks wrong and is what the specification says (§ 9.2).
+//
+// `a`, `b` and `c` are ZERO where they would be off the top or the
+// left of the image.  That is what makes the first row and the first
+// pixel of every row work, and it is the case a hand-written unfilter
+// forgets.
+//
+// AVERAGE ROUNDS DOWN AND PAETH IS NOT A PREDICTION OF ANYTHING
+//
+// `Average`'s division truncates, and the sum `a + b` is computed at
+// full width BEFORE the division — so `(255 + 255) / 2` is 255 and not
+// 127.  `Paeth` picks whichever of `a`, `b` and `c` is closest to
+// `a + b - c`, with ties going to `a`, then `b`, then `c`; it is a
+// selector rather than an average, which is why it survives an edge in
+// the image instead of smearing it.
+//
+// THE CHOICE IS libpng'S AND NOT THE SPECIFICATION'S
+//
+// Nothing in PNG says how to pick a filter for a row.  `choose` below
+// implements the minimum-sum-of-absolute-differences heuristic every
+// encoder uses because libpng did it first: filter the row five ways,
+// sum each result's bytes read as signed, keep the smallest.  It is a
+// good heuristic and it is not correctness — an encoder that always
+// chose `PngFilterNone` produces a larger file that every decoder
+// reads.  A test may assert that this package's output DECODES; it may
+// not assert which filter a row got.
+
+use png
+
+// One of PNG's five row filters.
+//
+// The filter is chosen per ROW, not per image, and the byte that says
+// which sits in front of the row inside the compressed stream — so it
+// is filtered data, and a decoder learns a row's filter only after
+// inflating far enough to reach it.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     println("${pngfilter.filter_byte(PngFilterPaeth)}")  // 4
+// ```
+pub enum PngFilter
+    // 0 — the bytes as they are.  Right for a row that is already
+    // incompressible, and for the first row of a palette image where
+    // the differences between indices mean nothing.
+    PngFilterNone
+    // 1 — the difference from the pixel to the left.
+    PngFilterSub
+    // 2 — the difference from the pixel above.
+    PngFilterUp
+    // 3 — the difference from the truncated mean of left and above.
+    PngFilterAverage
+    // 4 — the difference from the Paeth predictor of left, above and
+    // above-left.
+    PngFilterPaeth
+
+// The filter's own number, `0 ..= 4`.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     println("${pngfilter.filter_byte(PngFilterNone)}")   // 0
+// ```
+pub fn filter_byte(f: PngFilter) -> Int
+    todo("png-nv.pngfilter.filter_byte")
+
+// The filter a byte names, or `None` for a byte that names no filter.
+//
+// Bytes above 4 are the corrupt case, and they are the FIRST sign a
+// decoder gets that a zlib stream inflated to something that is not
+// image data — which is why this answers an optional rather than
+// defaulting to `PngFilterNone`.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     match pngfilter.filter_of(9)
+//         Some(_) => println("a filter")
+//         None    => println("not a filter")               // this one
+// ```
+pub fn filter_of(b: Int) -> ?PngFilter
+    todo("png-nv.pngfilter.filter_of")
+
+// The Paeth predictor of three bytes.
+//
+// Whichever of `a` (left), `b` (above) and `c` (above-left) is closest
+// to `a + b - c`, with ties broken in that order.  Spelled out as its
+// own function because the tie-breaking order is the part an
+// implementation gets wrong and the part a test can pin.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     println("${pngfilter.paeth(1, 2, 3)}")               // 2
+// ```
+pub fn paeth(a: Int, b: Int, c: Int) -> Int
+    todo("png-nv.pngfilter.paeth")
+
+// Undo a filter on one row.
+//
+// `row` is the filtered bytes WITHOUT the leading filter byte; `prior`
+// is the already-unfiltered row above, or an empty buffer for the
+// first row of a pass.  `stride` is `png.filter_stride` — how many
+// bytes back the left neighbour is.
+//
+// The result is the row's raw samples, in the file's own colour type
+// and bit depth.  Nothing here converts to a colour: a row of a 4K
+// 16-bit RGBA image is 64 KiB, and turning each sample into a value
+// would cost twenty times that for data the caller is about to write
+// into a buffer anyway.
+//
+// **Unfiltering is sequential within a row**: byte `i` depends on byte
+// `i - stride` of the row being produced, not of the row that arrived.
+// A caller cannot parallelise inside a row, and `prior` being the
+// UNFILTERED row above means they cannot parallelise across rows
+// either.  That is the format, and it is why a PNG decoder is not
+// embarrassingly parallel.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     let out = pngfilter.unfilter_row(PngFilterNone, bytes.zeros(3), bytes.zeros(0), 1)
+//     println("${bytes.len(out)}")                         // 3
+// ```
+pub fn unfilter_row(f: PngFilter, row: Bytes, prior: Bytes, stride: Int) -> Bytes
+    todo("png-nv.pngfilter.unfilter_row")
+
+// Apply a filter to one row.
+//
+// The inverse of `unfilter_row`, with the same arguments: `row` is raw
+// samples, `prior` is the raw row above — NOT the filtered one, which
+// is the asymmetry between the two directions and the one an encoder
+// gets wrong.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     let out = pngfilter.filter_row(PngFilterUp, bytes.zeros(3), bytes.zeros(3), 1)
+//     println("${bytes.len(out)}")                         // 3
+// ```
+pub fn filter_row(f: PngFilter, row: Bytes, prior: Bytes, stride: Int) -> Bytes
+    todo("png-nv.pngfilter.filter_row")
+
+// The filter this row compresses best under, by libpng's heuristic.
+//
+// Filter the row five ways, sum each result's bytes read as SIGNED,
+// keep the smallest.  Reading them as signed is the point: a
+// difference of -1 stores as 255, and an unsigned sum would call it
+// the largest possible value rather than the smallest.
+//
+// This is a heuristic and not a rule — see this module's header.  An
+// encoder is free to ignore it, and `PngFilterNone` on every row
+// produces a valid file.
+//
+// ```novo
+// use pngfilter
+//
+// fn main() [io]
+//     let f = pngfilter.choose(bytes.zeros(4), bytes.zeros(4), 1)
+//     println("${pngfilter.filter_byte(f) >= 0}")          // true
+// ```
+pub fn choose(row: Bytes, prior: Bytes, stride: Int) -> PngFilter
+    todo("png-nv.pngfilter.choose")
+
+// The filter to use when a caller wants a fixed one for every row.
+//
+// `PngFilterNone` for a palette or a 1-bit image, where a difference
+// between two indices is meaningless and filtering usually makes the
+// file larger, and `PngFilterPaeth` otherwise.  It is what an encoder
+// with no time to run `choose` should do, and it is the same advice
+// libpng gives in a comment nobody reads.
+//
+// ```novo
+// use pngfilter
+// use png
+//
+// fn main() [io]
+//     let i = PngInfo { width: 4, height: 4, color: PngIndexed, depth: PngDepth8, interlace: PngNoInterlace }
+//     println("${pngfilter.filter_byte(pngfilter.default_for(i))}")    // 0
+// ```
+pub fn default_for(i: PngInfo) -> PngFilter
+    todo("png-nv.pngfilter.default_for")

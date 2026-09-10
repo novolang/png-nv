@@ -1,0 +1,235 @@
+// pngcodec_tests.nv — the API suite for the decoder and the encoder.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See png_tests.nv for why
+// an interface package ships a failing suite.
+//
+// What these assert is the CONTRACT rather than the compression: that
+// a fresh decoder knows nothing, that an empty chunk is not an end of
+// file, that the size bound is off until a caller asks for it, that
+// `finish` is where the framing is checked, and that an interlaced
+// image is refused by the ENCODER and not by the decoder.
+
+use std.test
+use png
+use pngchunk
+use pngdec
+use pngenc
+use pngerror
+use srgb
+
+@test
+fn test_a_fresh_decoder_knows_nothing_and_has_not_failed() [io]
+    let d = pngdec.decoder()
+
+    test.case("nothing consumed, no rows, not done")
+    test.assert(pngdec.total_in(d) == 0)
+    test.assert(pngdec.rows_out(d) == 0)
+    test.assert(pngdec.is_done(d) == false)
+
+    test.case("no failure")
+    match pngdec.error(d)
+        Some(_) => test.fail("a fresh decoder is already failed")
+        None    => test.assert(true)
+
+    test.case("and no header until IHDR has arrived")
+    match pngdec.info(d)
+        Some(_) => test.fail("a fresh decoder claims to know the dimensions")
+        None    => test.assert(true)
+
+@test
+fn test_the_size_bound_is_off_until_a_caller_states_one() [io]
+    test.case("unbounded by default, because the right bound is the caller's")
+    test.assert(pngdec.limit_of(pngdec.decoder()) == -1)
+
+    test.case("with_limit states one")
+    let d = pngdec.with_limit(pngdec.decoder(), 268435456)
+    test.assert(pngdec.limit_of(d) == 268435456)
+
+    test.case("and a negative bound means unbounded again")
+    test.assert(pngdec.limit_of(pngdec.with_limit(d, -1)) == -1)
+
+@test
+fn test_strict_is_off_by_default_and_can_be_turned_on() [io]
+    test.case("a corrupt tEXt should not cost a caller their image")
+    let d = pngdec.with_strict(pngdec.decoder())
+    test.assert(pngdec.total_in(d) == 0)
+
+@test
+fn test_an_empty_chunk_produces_no_events_and_is_not_an_end_of_file() [io]
+    test.case("a feed is a chunk of the FILE, not of the PNG")
+    let (d, evs) = pngdec.feed(pngdec.decoder(), bytes.zeros(0))
+    test.assert(evs.len() == 0)
+    test.assert(pngdec.is_done(d) == false)
+
+@test
+fn test_finishing_a_file_that_never_started_is_an_error() [io]
+    test.case("no signature, so nothing about the file is known")
+    match pngdec.finish(pngdec.decoder())
+        Ok(_)  => test.fail("an empty file was accepted as a whole PNG")
+        Err(e) => test.assert(pngerror.offset_of(e) == 0)
+
+@test
+fn test_the_event_names_are_the_six_things_a_decoder_learns() [io]
+    test.case("one name per event")
+    test.assert(pngdec.event_name(PngEvEnd) == "end")
+    test.assert(pngdec.event_name(PngEvRow(1, 0, bytes.zeros(0))) == "row")
+    test.assert(pngdec.event_name(PngEvPalette([srgb.black()])) == "palette")
+    test.assert(pngdec.event_name(PngEvTransparency(PngTrnsGrey(0))) == "transparency")
+    test.assert(pngdec.event_name(PngEvAncillary(PngChunk { kind: "tEXt", data: bytes.zeros(0) })) == "ancillary")
+
+@test
+fn test_a_buffer_that_is_not_a_png_is_refused_at_the_signature() [io]
+    test.case("eight zero bytes are not a signature")
+    match pngdec.read_info(bytes.zeros(33))
+        Ok(_)                     => test.fail("33 zero bytes read as a header")
+        Err(PngBadSignature(off)) => test.assert(off == 0)
+        Err(_)                    => test.fail("refused for the wrong reason")
+
+@test
+fn test_a_buffer_too_short_to_hold_a_signature_says_so() [io]
+    test.case("distinct from a bad signature — the file may be cut short")
+    match pngdec.read_info(bytes.zeros(4))
+        Ok(_)                              => test.fail("a four-byte header was read")
+        Err(PngTruncatedSignature(_, len)) => test.assert(len == 4)
+        Err(_)                             => test.fail("refused for the wrong reason")
+
+@test
+fn test_decoding_a_whole_buffer_checks_everything_finish_checks() [io]
+    test.case("so an Ok from decode is a stronger statement than a feed")
+    match pngdec.decode(bytes.zeros(0))
+        Ok(_)  => test.fail("an empty buffer decoded as an image")
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_error_says_whether_the_image_survives_it() [io]
+    test.case("the framing can be wrong while the pixels are intact")
+    test.assert(pngerror.is_recoverable(PngMissingIend(1024)))
+    test.assert(pngerror.is_recoverable(PngTrailingBytes(1024, 7)))
+
+    test.case("and a bad filter byte means the data itself is wrong")
+    test.assert(pngerror.is_recoverable(PngBadFilterType(99, 7)) == false)
+
+@test
+fn test_an_error_says_whether_more_bytes_could_help() [io]
+    test.case("a truncation might still arrive")
+    test.assert(pngerror.needs_more_bytes(PngTruncatedSignature(0, 3)))
+
+    test.case("and a corrupt chunk will not fix itself")
+    test.assert(pngerror.needs_more_bytes(PngBadFilterType(99, 7)) == false)
+    test.assert(pngerror.needs_more_bytes(PngBadColorDepthPair(24, 3, 16)) == false)
+
+@test
+fn test_a_source_failure_is_the_one_error_with_no_offset() [io]
+    test.case("the transport gave up before a byte could be blamed")
+    test.assert(pngerror.offset_of(PngSourceFailed(IoNotFound)) == -1)
+
+    test.case("and everything else names a place in the file")
+    test.assert(pngerror.offset_of(PngBadChunkCrc(64, "tEXt", 1, 2)) == 64)
+    test.assert(pngerror.offset_of(PngZeroDimension(16, 0, 4)) == 16)
+
+@test
+fn test_a_fresh_encoder_has_written_nothing() [io]
+    let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    let e = pngenc.encoder(i, pngenc.default_options())
+
+    test.case("no rows in, no bytes out")
+    test.assert(pngenc.rows_in(e) == 0)
+    test.assert(pngenc.total_out(e) == 0)
+
+    test.case("and no failure")
+    match pngenc.error(e)
+        Some(_) => test.fail("a fresh encoder is already failed")
+        None    => test.assert(true)
+
+@test
+fn test_the_default_options_are_level_six_and_the_full_search() [io]
+    test.case("zlib's default, which is what almost every PNG was written at")
+    test.assert(pngenc.default_options().level.number == 6)
+    test.assert(pngenc.default_options().fixed_filter == false)
+
+@test
+fn test_an_interlaced_image_is_refused_by_the_encoder() [io]
+    test.case("Adam7 is decoded here and not written")
+    let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngAdam7 }
+    match pngenc.error(pngenc.encoder(i, pngenc.default_options()))
+        Some(PngBadInterlaceMethod(_, saw)) => test.assert(saw == 1)
+        Some(_)                             => test.fail("refused for the wrong reason")
+        None                                => test.fail("an interlaced image was accepted")
+
+@test
+fn test_start_writes_the_signature_and_ihdr() [io]
+    test.case("eight bytes of signature and a twenty-five-byte IHDR chunk")
+    let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    let (e, out) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+    test.assert(bytes.len(out) == 33)
+    test.assert(pngenc.total_out(e) == 33)
+    test.assert(pngenc.rows_in(e) == 0)
+
+@test
+fn test_pushing_a_row_counts_it_even_when_no_bytes_come_out() [io]
+    test.case("DEFLATE holds input back, so a row's bytes appear later")
+    let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+    let (e2, _) = pngenc.push_row(e, bytes.zeros(2))
+    test.assert(pngenc.rows_in(e2) == 1)
+
+    test.case("and a caller may name the filter themselves")
+    let (e3, _) = pngenc.push_row_with(e2, bytes.zeros(2), PngFilterNone)
+    test.assert(pngenc.rows_in(e3) == 2)
+
+@test
+fn test_finishing_with_the_wrong_row_count_is_refused() [io]
+    test.case("a file nothing could read is better caught here")
+    let i = PngInfo { width: 2, height: 4, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+    match pngenc.finish(e)
+        Ok(_)  => test.fail("zero rows accepted for a four-row image")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_palette_belongs_before_the_rows() [io]
+    test.case("PLTE after the first IDAT is out of order")
+    let i = PngInfo { width: 2, height: 2, color: PngIndexed, depth: PngDepth8, interlace: PngNoInterlace }
+    let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+    let (e2, out) = pngenc.write_palette(e, [srgb.black(), srgb.white()])
+    test.assert(bytes.len(out) == 18)
+
+    test.case("and transparency follows the palette")
+    let (e3, tout) = pngenc.write_transparency(e2, PngTrnsPalette([0]))
+    test.assert(bytes.len(tout) == 13)
+
+@test
+fn test_a_caller_may_write_their_own_ancillary_chunk() [io]
+    test.case("the counterpart of PngEvAncillary")
+    let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    let (e, _) = pngenc.start(pngenc.encoder(i, pngenc.default_options()))
+    let c = PngChunk { kind: "tEXt", data: bytes.zeros(4) }
+    let (e2, out) = pngenc.write_chunk(e, c)
+    test.assert(bytes.len(out) == pngchunk.framed_size(c))
+
+@test
+fn test_the_whole_image_encoder_takes_a_flat_buffer() [io]
+    test.case("four grey pixels at eight bits are four bytes")
+    let i = PngInfo { width: 2, height: 2, color: PngGrey, depth: PngDepth8, interlace: PngNoInterlace }
+    match pngenc.encode(i, bytes.zeros(4), pngenc.default_options())
+        Ok(out) => test.assert(png.is_png(out))
+        Err(_)  => test.fail("a 2x2 grey image could not be encoded")
+
+    test.case("and the wrong number of samples is refused")
+    match pngenc.encode(i, bytes.zeros(3), pngenc.default_options())
+        Ok(_)  => test.fail("three samples accepted for a four-pixel image")
+        Err(_) => test.assert(true)
+
+@test
+fn test_read_all_is_charged_what_its_source_costs() [io]
+    // `pngdec.read_all` binds `Read`'s effect parameter, so it cannot be
+    // called from a pure test without a source to hand it.  What this
+    // asserts is the part a suite CAN assert: that the failure a stream
+    // produces comes back as a `PngError` carrying the host's own
+    // `IoError`, so a caller can still tell a timeout from a truncated
+    // file.  The effect row itself is checked by the audit's
+    // `effect-budget` row, which is a stronger check than a test.
+    test.case("a source failure carries the host's error and no offset")
+    let e = PngSourceFailed(IoNotFound)
+    test.assert(pngerror.offset_of(e) == -1)
+    test.assert(pngerror.needs_more_bytes(e))

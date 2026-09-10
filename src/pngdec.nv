@@ -1,0 +1,427 @@
+// pngdec.nv — the decoder: a feed-and-drain state machine over EVENTS,
+// so that a caller never has to hold the file.
+//
+// THE SHAPE, AND THE ARGUMENT FOR IT
+//
+// `docs/publishing.md` § "How a `core` package takes bytes from its
+// host" offers four shapes.  This is the second — feed and drain over
+// events — and PNG chooses it rather than the author choosing it:
+//
+//   * **Feed and drain over ROWS is not enough.**  A PNG is a chunk
+//     stream, and a caller has to be told about PLTE before any pixel
+//     means anything, about tRNS before any pixel's alpha does, and
+//     about an unknown critical chunk before it trusts anything at
+//     all.  A `feed` that returned only pixels would have had to
+//     buffer the metadata and hand it over at the end, by which time
+//     the caller has already written the wrong pixels somewhere.
+//   * **"The core asks, the host performs" is wrong for PNG.**  That
+//     shape is for a format random access buys something in —
+//     btree-nv's pages, zip-nv's ranges.  A PNG is read once, front to
+//     back: IDAT is a single zlib stream split arbitrarily across
+//     chunks, so there is nothing to seek to and nothing a byte-range
+//     request could skip.
+//   * **The payload never accumulates.**  A `PngEvRow` carries ONE
+//     row, in the file's own colour type and depth, and the decoder
+//     keeps exactly one row of history because that is what the
+//     filters need.  So the decoder's state is bounded by the image's
+//     WIDTH and not by its size: a 100,000-pixel-tall photograph
+//     decodes in a few hundred kilobytes.
+//
+// That is the whole of "the decoder must not require the whole file in
+// memory".  The whole-buffer `decode` below does require it, and says
+// so; it is a convenience for the caller who has the file anyway.
+//
+// ROWS DO NOT ARRIVE IN RASTER ORDER
+//
+// `PngEvRow` carries a PASS number, and for an interlaced image it
+// runs 1 to 7 with the rows of each pass in its own coordinate system.
+// A caller that ignored the pass would compose an Adam7 image into the
+// top eighth of its canvas.  For a non-interlaced image the pass is
+// always 1 and `y` is the image row, so the general loop and the
+// simple one are the same code — which is why the field is there even
+// for callers who will never meet an interlaced file.
+//
+// WHAT `feed` DOES NOT DO
+//
+// It does not return a `Result`.  A file that goes bad at row 4,000
+// does not throw away the 3,999 rows before it, and a signature that
+// made the failure the return value would have had to choose between
+// the rows and the reason.  The failure is sticky — `error` asks — and
+// once set every subsequent `feed` drains nothing.
+//
+// It also hands back rows it cannot yet vouch for: the CRC of the IDAT
+// chunk a row came out of has been checked, but the zlib stream's
+// Adler-32 covers the whole image and is only verified at the end.
+// Only a successful `finish` says the pixels were correct.
+
+use png
+use pngadam7
+
+// Something the decoder learned from the bytes it was fed.
+//
+// The events arrive in the order the file carries them, which is the
+// order the specification fixes: `PngEvInfo` first, always; `PngEvEnd`
+// last, always; palette and transparency before any row.  A caller can
+// therefore act on each event as it arrives rather than accumulating
+// them, which is the point.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.event_name(PngEvEnd)}")            // end
+// ```
+pub enum PngEvent
+    // IHDR has been read.  Always the first event, and everything
+    // after it is in terms of this.
+    PngEvInfo(info: PngInfo)
+    // PLTE has been read.  At most 256 colours; required for an
+    // indexed image and advisory for a truecolour one, where it is a
+    // suggested quantisation a viewer with few colours may use.
+    PngEvPalette(colors: [Srgb8])
+    // tRNS has been read.  It changes the PIXELS, so a caller that
+    // ignores this event produces an opaque image where the file said
+    // otherwise.
+    PngEvTransparency(t: PngTransparency)
+    // An ancillary chunk that is not one of the ones above, whole and
+    // unparsed.  Every conforming decoder skips what it does not
+    // recognise, so this event is how a caller acts on gAMA, pHYs,
+    // tEXt, iCCP or a private chunk without this package having to
+    // know what any of them mean.
+    PngEvAncillary(chunk: PngChunk)
+    // One unfiltered row of raw samples, in the file's own colour type
+    // and bit depth.  `pass_no` is 1 for a non-interlaced image and
+    // `1 ..= 7` for an interlaced one; `y` is the row WITHIN the pass.
+    // `pngadam7.place` turns the two into image coordinates.
+    //
+    // The samples are bytes rather than colours because a row of a 4K
+    // 16-bit RGBA image is 64 KiB and turning each sample into a value
+    // would cost twenty times that for data the caller is about to
+    // write into a buffer.
+    PngEvRow(pass_no: Int, y: Int, samples: Bytes)
+    // IEND has been read.  Always the last event.
+    PngEvEnd
+
+// The name of an event, for a message or an inspector's output.
+//
+// `info`, `palette`, `transparency`, `ancillary`, `row`, `end`.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.event_name(PngEvEnd)}")            // end
+// ```
+pub fn event_name(e: PngEvent) -> Str
+    todo("png-nv.pngdec.event_name")
+
+// A decoder between chunks.
+//
+// Opaque in practice — the fields are here so the state is reviewable
+// rather than because a caller should read them — and carried by
+// value: `feed` returns the next one and the previous one is finished
+// with.
+//
+// **The state is bounded by the image's WIDTH**, not by its size: the
+// largest things in it are one row of history for the filters and the
+// 32 KiB window inside the inflater.  A decoder for a 4K image is
+// about 100 KiB whatever its height.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.total_in(pngdec.decoder())}")      // 0
+// ```
+pub struct PngDecoder
+    // The header, once IHDR has been read.
+    info: ?PngInfo
+    // The palette, once PLTE has been read.
+    palette: [Srgb8]
+    // Bytes consumed so far, across every `feed`.  The origin every
+    // `PngError` offset is measured from.
+    consumed: Int
+    // Rows drained so far, across every pass.
+    rows_out: Int
+    // Which Adam7 pass is being decoded, `1 ..= 7`; 1 throughout for a
+    // non-interlaced image.
+    pass_no: Int
+    // The previous unfiltered row, which the filters refer back to.
+    // Reset to empty at the start of every pass, because a filter must
+    // not reach across a pass boundary.
+    prior: Bytes
+    // Bytes of a partial chunk header, chunk body or filtered row
+    // carried over from the last chunk fed.
+    pending: Bytes
+    // The inflater over the IDAT chain, as a value.  It is one zlib
+    // stream however many IDAT chunks carry it.
+    inflater: Inflater
+    // Whether `with_strict` was asked for: refuse a bad CRC even on an
+    // ancillary chunk, and refuse trailing bytes.
+    strict: Bool
+    // A bound on the decoded size, or `-1` for unbounded.
+    limit: Int
+    // The sticky failure, or absent.
+    failure: ?PngError
+
+// A decoder at the start of a file.
+//
+// It knows nothing until the signature and IHDR have arrived, so
+// `info` answers `None` until then.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     match pngdec.info(pngdec.decoder())
+//         Some(_) => println("known")
+//         None    => println("not yet")                    // this one
+// ```
+pub fn decoder() -> PngDecoder
+    todo("png-nv.pngdec.decoder")
+
+// Refuse what a lenient decoder would forgive.
+//
+// Turns a bad CRC on an ancillary chunk, an unknown ancillary chunk
+// whose reserved bit is set, a missing IEND and trailing bytes from
+// recoverable into fatal.  Lenient is the default, because a corrupt
+// tEXt should not cost a caller their image; a caller archiving or
+// validating files wants this on.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     let d = pngdec.with_strict(pngdec.decoder())
+//     println("${pngdec.total_in(d)}")                     // 0
+// ```
+pub fn with_strict(d: PngDecoder) -> PngDecoder
+    todo("png-nv.pngdec.with_strict")
+
+// Cap how many bytes of image data this decoder will produce.
+//
+// A PNG's dimensions are two 32-bit fields, so a 40-byte header can
+// claim an image of four billion by four billion — and the IDAT that
+// fills it with zeroes compresses to almost nothing.  That is the
+// decompression bomb every image decoder is eventually handed, and the
+// right bound is the caller's memory budget rather than this package's
+// opinion.  The default is unbounded and this is how a caller states
+// one; past it the decoder fails with `PngExtraImageData`.
+//
+// A negative bound means unbounded again.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     let d = pngdec.with_limit(pngdec.decoder(), 268435456)
+//     println("${pngdec.limit_of(d)}")                     // 268435456
+// ```
+pub fn with_limit(d: PngDecoder, cap: Int) -> PngDecoder
+    todo("png-nv.pngdec.with_limit")
+
+// The decoder's output bound, or `-1` for unbounded.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.limit_of(pngdec.decoder())}")      // -1
+// ```
+pub fn limit_of(d: PngDecoder) -> Int
+    todo("png-nv.pngdec.limit_of")
+
+// Hand the decoder a chunk of file and take the events it produced.
+//
+// The load-bearing call.  A chunk of the FILE, not a chunk of the PNG:
+// the two have nothing to do with each other, and a feed may split a
+// PNG chunk header, a row, or the two bytes of the zlib header.
+// Whatever could not be finished is carried in the decoder.
+//
+// An empty chunk is legal and produces no events.  A chunk fed to a
+// decoder that has already failed produces nothing and leaves the
+// failure alone.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     let (d, evs) = pngdec.feed(pngdec.decoder(), bytes.zeros(0))
+//     println("${evs.len()}")                              // 0
+// ```
+pub fn feed(d: PngDecoder, chunk: Bytes) -> (PngDecoder, [PngEvent])
+    todo("png-nv.pngdec.feed")
+
+// End the file and say whether it was whole.
+//
+// This is where a file that stopped mid-chunk, a file with no IEND,
+// and a zlib stream whose Adler-32 does not match become errors — none
+// of them can be detected while bytes are still arriving.  `Ok` means
+// every row the header promised was produced and the stream verified.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     match pngdec.finish(pngdec.decoder())
+//         Ok(_)  => println("whole")
+//         Err(_) => println("not whole")                   // this one
+// ```
+pub fn finish(d: PngDecoder) -> Result<Unit, PngError>
+    todo("png-nv.pngdec.finish")
+
+// The image description, once IHDR has been read.
+//
+// `None` before that.  A caller who needs the dimensions in order to
+// allocate somewhere to put the rows feeds the first chunk, asks, and
+// then decides — which is the whole reason the events and this
+// accessor are separate.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     match pngdec.info(pngdec.decoder())
+//         Some(i) => println("${i.width}")
+//         None    => println("not yet")                    // this one
+// ```
+pub fn info(d: PngDecoder) -> ?PngInfo
+    todo("png-nv.pngdec.info")
+
+// The sticky failure, if the decoder has one.
+//
+// Once set it is never cleared: a chunk stream that has lost its place
+// cannot resynchronise, and a decoder that tried would be inventing
+// pixels.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     match pngdec.error(pngdec.decoder())
+//         Some(_) => println("already bad")
+//         None    => println("clean")                      // this one
+// ```
+pub fn error(d: PngDecoder) -> ?PngError
+    todo("png-nv.pngdec.error")
+
+// How many bytes of file have been consumed across every `feed`.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.total_in(pngdec.decoder())}")      // 0
+// ```
+pub fn total_in(d: PngDecoder) -> Int
+    todo("png-nv.pngdec.total_in")
+
+// How many rows have been drained, across every pass.
+//
+// For an interlaced image this counts the passes' rows and not the
+// image's, so it exceeds the image height by nothing and reaches it by
+// a different route — `pngadam7.pass_height` summed over the seven is
+// the number to compare it with.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.rows_out(pngdec.decoder())}")      // 0
+// ```
+pub fn rows_out(d: PngDecoder) -> Int
+    todo("png-nv.pngdec.rows_out")
+
+// Whether every row the header promised has been drained.
+//
+// True before `finish` has been called and before IEND has been seen —
+// it is a statement about the rows, not about the file.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     println("${pngdec.is_done(pngdec.decoder())}")       // false
+// ```
+pub fn is_done(d: PngDecoder) -> Bool
+    todo("png-nv.pngdec.is_done")
+
+// Read just the header out of a buffer.
+//
+// The signature and IHDR: thirty-three bytes, and it touches no more
+// than that.  A caller deciding whether to commit memory to an image —
+// a thumbnailer, a web server sizing an upload — asks this first, and
+// an `Ok` is a promise that `png.filtered_size` will not overflow.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     match pngdec.read_info(bytes.zeros(33))
+//         Ok(_)  => println("read")
+//         Err(_) => println("not a PNG header")            // this one
+// ```
+pub fn read_info(src: Bytes) -> Result<PngInfo, PngError>
+    todo("png-nv.pngdec.read_info")
+
+// Decode a whole file held in memory into its header and its samples.
+//
+// The convenience for the caller who has the file anyway.  It DOES
+// require the whole file and the whole image in memory at once, which
+// is exactly what the event decoder exists to avoid — so the choice
+// between them is a real one and this is the wrong side of it for
+// anything large or anything from a network.
+//
+// The samples come back as one buffer in raster order at the file's
+// own colour type and bit depth, with the Adam7 passes already
+// composed and the filters already undone.  Nothing is converted:
+// image-nv is where a 4-bit palette image becomes RGBA.
+//
+// ```novo
+// use pngdec
+//
+// fn main() [io]
+//     match pngdec.decode(bytes.zeros(0))
+//         Ok(_)  => println("decoded")
+//         Err(_) => println("not a PNG")                   // this one
+// ```
+pub fn decode(src: Bytes) -> Result<(PngInfo, Bytes), PngError>
+    todo("png-nv.pngdec.decode")
+
+// Decode a whole file from a stream, charged what the stream costs.
+//
+// THE ONE EFFECT-POLYMORPHIC SIGNATURE IN THIS PACKAGE.  `S: Read[e]`
+// binds the effect parameter of the standard library's `Read` trait
+// and the clause is `[e]`, so the row means "whatever the impl behind
+// `S` supplies" — a `File` charges its caller `[io, fs]`, an in-memory
+// buffer charges nothing, and png-nv remains `core` because it has
+// named no effect of its own (SPEC § 5.6).
+//
+// It is the same machine as `feed` and `finish` with the pump written
+// once, here, instead of once per caller — and it is worth having in
+// THIS package where qoi-nv declined it, because a compressed PNG can
+// be a hundredth of the image it decodes to.  A caller who cannot hold
+// the file may still be able to hold the picture.
+//
+// A stream failure comes back as `PngSourceFailed` carrying the host's
+// own `IoError`, so a caller can still tell a timeout from a truncated
+// file.
+//
+// ```novo
+// use pngdec
+// use pngerror
+//
+// fn read_png(path: Str) -> Result<(PngInfo, Bytes), PngError> [io, fs]
+//     match File.open_read(path)
+//         None    => Err(PngSourceFailed(IoNotFound))
+//         Some(f) =>
+//             let h: File = f
+//             pngdec.read_all(h)
+//
+// fn main() [io, fs]
+//     match read_png("in.png")
+//         Ok(_)  => println("decoded")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_all<S: Read[e]>(src: S) -> Result<(PngInfo, Bytes), PngError> [e]
+    todo("png-nv.pngdec.read_all")
