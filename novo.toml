@@ -1,6 +1,6 @@
 [package]
 name        = "png-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "PNG on its own: the signature, the chunk structure with the four case flags that decide what a reader may skip, IHDR through IEND, all five row filters both directions, every legal colour type and bit depth including palette and 16-bit, Adam7 decoded, and both directions over flate-nv by a decoder that never holds the file."
 license     = "Apache-2.0"
 
